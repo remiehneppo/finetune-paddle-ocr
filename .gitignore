@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+.venv/
+runs/
+.pytest_cache/
+.codegraph/
+.superpowers/
+PaddleOCR/
+models/*.pdparams
+models/*.part
+.paddleocr-labeler/
+.paddleocr-det-labeler/

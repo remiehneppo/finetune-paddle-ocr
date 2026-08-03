@@ -1,0 +1,75 @@
+<!doctype html>
+<html lang="vi">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>PaddleOCR Labeler</title>
+    <link rel="stylesheet" href="/static/styles.css" />
+  </head>
+  <body>
+    <header class="topbar">
+      <strong id="app-title">PaddleOCR Labeler</strong>
+      <label class="folder-control">
+        <span>Folder ảnh</span>
+        <input id="folder-path" aria-label="Folder ảnh" placeholder="/đường/dẫn/đến/ảnh" />
+      </label>
+      <button id="open-folder">Mở folder</button>
+      <label class="progress-control" for="batch-progress">
+        <span>Tiến độ</span>
+        <progress id="batch-progress" value="0" max="1"></progress>
+      </label>
+      <span id="model-status" role="status">Đang kiểm tra model</span>
+      <div class="topbar-actions" aria-label="Tác vụ OCR">
+        <button id="ocr-current">OCR ảnh này</button>
+        <button id="ocr-batch">OCR toàn folder</button>
+        <button id="cancel-batch">Dừng</button>
+        <button id="toggle-completed">Đánh dấu hoàn tất</button>
+        <button id="export-jsonl">Xuất JSONL</button>
+      </div>
+      <span id="save-status" role="status">Chưa lưu</span>
+    </header>
+    <main class="workspace">
+      <aside class="image-sidebar" aria-label="Danh sách ảnh">
+        <div class="sidebar-heading">
+          <strong>Danh sách ảnh</strong>
+          <span id="image-count">Chưa mở folder</span>
+        </div>
+        <input id="image-search" aria-label="Tìm tên ảnh" placeholder="Tìm tên ảnh..." />
+        <nav id="image-filters" aria-label="Trạng thái ảnh"></nav>
+        <ol id="image-list" aria-label="Ảnh trong folder"></ol>
+      </aside>
+      <section class="canvas-panel" aria-label="Trang tài liệu">
+        <div class="canvas-toolbar" role="toolbar" aria-label="Công cụ vùng văn bản">
+          <span id="task-name">Vẽ vùng văn bản</span>
+          <span id="task-help">Kéo trên trang để tạo vùng</span>
+          <button id="zoom-out" aria-label="Thu nhỏ">−</button>
+          <output id="zoom-level" aria-label="Mức thu phóng">100%</output>
+          <button id="zoom-in" aria-label="Phóng to">+</button>
+        </div>
+        <div id="page-stage" role="region" tabindex="0" aria-label="Trang và vùng văn bản">
+          <img id="page-image" alt="" />
+          <svg id="overlay" role="group" aria-label="Các vùng văn bản và tay nắm chỉnh sửa"></svg>
+        </div>
+      </section>
+      <aside class="inspector" aria-label="Khối nội dung">
+        <div class="inspector-heading">
+          <strong>Khối nội dung</strong>
+          <span id="block-count">0 khối</span>
+        </div>
+        <ol id="block-list" aria-label="Thứ tự đọc của khối"></ol>
+        <section class="crop-panel" aria-label="Ảnh crop">
+          <span>Ảnh crop</span>
+          <canvas id="crop-preview"></canvas>
+        </section>
+        <label id="editor-label" class="editor-label" for="text-editor">Văn bản đã nhận dạng</label>
+        <textarea id="text-editor" aria-label="Văn bản đã nhận dạng" placeholder="Chọn một vùng để chỉnh sửa văn bản"></textarea>
+        <div id="detection-controls" class="region-actions" hidden>
+          <label><input id="ignore-region" type="checkbox" /> Bỏ qua vùng này (###)</label>
+        </div>
+        <button id="delete-block" class="danger-button" type="button">Xóa vùng đã chọn</button>
+        <div id="point-editor" aria-label="Điểm của vùng"></div>
+      </aside>
+    </main>
+    <script type="module" src="/static/app.mjs"></script>
+  </body>
+</html>
