@@ -1,5 +1,11 @@
 # Fine-tune PaddleOCR tiếng Việt
 
+Pipeline LoRA cho **PaddleOCR-VL-1.6** được tài liệu riêng tại
+[docs/finetune-paddleocr-vl-1.6.md](docs/finetune-paddleocr-vl-1.6.md). Pipeline
+này dùng ERNIEKit và môi trường tách biệt với PP-OCRv6 bên dưới. Dataset VL đã
+prepare có thể dùng lại bằng `finetune_vl.py --prepared-from <prepare-run>` mà
+không sao chép hoặc xử lý lại ảnh.
+
 Script này fine-tune **text recognition** (ảnh crop chứa một từ/dòng chữ), không phải text detection trên ảnh trang đầy đủ. Nó nhận nhiều Hugging Face dataset đã `save_to_disk()` hoặc snapshot tải từ Hub có `data/*.parquet`, mỗi sample có:
 
 - `image`: `datasets.Image`, PIL image, bytes/path dictionary, hoặc đường dẫn ảnh;

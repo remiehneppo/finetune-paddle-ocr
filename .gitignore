@@ -1,6 +1,7 @@
 __pycache__/
 *.py[cod]
 .venv/
+.venv-vl-eval/
 runs/
 .pytest_cache/
 .codegraph/
@@ -8,5 +9,6 @@ runs/
 PaddleOCR/
 models/*.pdparams
 models/*.part
+models/PaddleOCR-VL-1.6/
 .paddleocr-labeler/
 .paddleocr-det-labeler/

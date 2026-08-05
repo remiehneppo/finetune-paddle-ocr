@@ -1,0 +1,8 @@
+# CPU-only data preparation environment for finetune_vl.py.
+# Keep this separate from both PP-OCRv6 and the ERNIEKit GPU environment.
+datasets==4.8.5
+huggingface_hub==1.26.0
+Pillow==12.3.0
+PyYAML==6.0.3
+safetensors==0.8.0
+transformers==5.14.1

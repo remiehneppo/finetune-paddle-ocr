@@ -1,0 +1,7 @@
+# Pinned GPU runtime validated with PaddleOCR-VL-1.6 on RTX 50 / SM120.
+# ERNIEKit checkout: 790a50b045d1aca2753d5395d8bec0806b2e6925
+paddlepaddle-gpu==3.2.1
+paddleformers==0.4.0
+safetensors==0.7.0
+transformers==4.55.4
+ml_dtypes==0.5.4
