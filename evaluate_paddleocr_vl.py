@@ -14,18 +14,19 @@ from pathlib import Path
 from typing import Any, Callable
 
 from finetune_vl import compute_ocr_metrics
+from paddleocr_vl_tasks import TASK_PROMPTS, task_for_prompt
 
-PROMPT = "OCR:"
+PROMPT = TASK_PROMPTS["ocr"]
 CANDIDATES = ("base", "merged")
 
 
-def ocr_messages(image: str) -> list[dict[str, object]]:
+def ocr_messages(image: str, prompt: str = PROMPT) -> list[dict[str, object]]:
     return [
         {
             "role": "user",
             "content": [
                 {"type": "image", "image": image},
-                {"type": "text", "text": PROMPT},
+                {"type": "text", "text": prompt},
             ],
         }
     ]
@@ -118,12 +119,20 @@ def load_validation_rows(
                     continue
                 payload = json.loads(line)
                 try:
-                    prompt, target = payload["text_info"]
+                    prompt_row, target = payload["text_info"]
                     image = payload["image_info"][0]
                 except (KeyError, IndexError, TypeError) as exc:
                     raise ValueError(f"Invalid OCR row {path}:{line_number}") from exc
-                if prompt != {"text": PROMPT, "tag": "mask"}:
-                    raise ValueError(f"Invalid OCR prompt {path}:{line_number}")
+                if (
+                    not isinstance(prompt_row, dict)
+                    or prompt_row.get("tag") != "mask"
+                    or not isinstance(prompt_row.get("text"), str)
+                ):
+                    raise ValueError(f"Invalid task prompt {path}:{line_number}")
+                try:
+                    task_for_prompt(prompt_row["text"])
+                except ValueError as exc:
+                    raise ValueError(f"Invalid task prompt {path}:{line_number}") from exc
                 if (
                     not isinstance(target, dict)
                     or target.get("tag") != "no_mask"
@@ -144,6 +153,7 @@ def load_validation_rows(
                         "dataset": dataset,
                         "image": str(image_path.resolve()),
                         "target": target["text"],
+                        "prompt": prompt_row["text"],
                     }
                 )
                 selected += 1
@@ -277,7 +287,7 @@ def evaluate(
             candidate_rows: list[dict[str, Any]] = []
             for row in rows:
                 rendered = processor.apply_chat_template(
-                    ocr_messages(row["image"]),
+                    ocr_messages(row["image"], row["prompt"]),
                     tokenize=False,
                     add_generation_prompt=True,
                 )
@@ -318,7 +328,8 @@ def evaluate(
     validate_candidate_coverage(predictions, CANDIDATES, len(rows))
     report = {
         "status": "passed",
-        "prompt": PROMPT,
+        "tasks": sorted({task_for_prompt(row["prompt"]) for row in rows}),
+        "prompts": sorted({row["prompt"] for row in rows}),
         "fixture_count": len(rows),
         "samples_per_dataset": args.samples_per_dataset,
         "max_new_tokens": args.max_new_tokens,

@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="vi">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>PaddleOCR-VL Layout Labeler</title>
+  <link rel="stylesheet" href="/static/styles.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div><h1>PaddleOCR-VL Layout Labeler</h1><p>PP-DocLayoutV3 + VL content → HF và COCO</p></div>
+    <div class="toolbar">
+      <input id="folder-path" placeholder="Đường dẫn folder ảnh" />
+      <button id="open-folder">Mở folder</button>
+      <span id="save-status">Chưa mở workspace</span>
+    </div>
+  </header>
+  <main class="workspace">
+    <aside class="sidebar">
+      <div class="heading"><strong>Ảnh</strong><span id="image-count">0</span></div>
+      <div class="actions"><button id="detect-batch">Detect folder</button><button id="prelabel-batch">Prelabel folder</button><button id="cancel-batch">Hủy</button></div>
+      <progress id="batch-progress" max="1" value="0"></progress><div id="batch-status"></div>
+      <ol id="image-list"></ol>
+    </aside>
+    <section class="canvas-panel">
+      <div class="canvas-toolbar"><span id="current-name">Chọn ảnh</span><button id="detect-current">Detect ảnh</button><button id="prelabel-page">Prelabel ảnh</button><button id="prelabel-current">Prelabel chọn</button><button id="add-mode">Thêm bbox</button><button id="complete-current">Complete</button></div>
+      <div id="page-stage" tabindex="0"><img id="page-image" alt="Trang tài liệu" /><svg id="overlay"></svg></div>
+    </section>
+    <aside class="inspector">
+      <div class="heading"><strong>Block</strong><span id="block-count">0</span></div>
+      <ol id="block-list"></ol>
+      <div id="editor" hidden>
+        <label>Layout label<select id="layout-label"></select></label>
+        <label>Task<select id="task"><option value="ocr">ocr</option><option value="table">table</option><option value="formula">formula</option><option value="chart">chart</option><option value="">Không xuất VL</option></select></label>
+        <label>Text<textarea id="text"></textarea></label>
+        <div id="layout-only-note" class="muted" hidden>Block layout-only: không prelabel và không xuất HF.</div>
+        <label class="inline"><input id="skipped" type="checkbox" /> Bỏ qua block</label>
+        <div class="muted" id="block-meta"></div><button id="delete-block" class="danger">Xóa block</button>
+      </div>
+      <div class="export-box"><label>Output folder<input id="export-path" placeholder="/tmp/document-layout-export" /></label><div class="export-actions"><button id="export-hf">Export HF</button><button id="export-layout">Export Layout</button><button id="export-all">Export All</button></div></div>
+    </aside>
+  </main>
+  <script type="module" src="/static/app.mjs"></script>
+</body>
+</html>

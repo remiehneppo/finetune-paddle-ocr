@@ -9,6 +9,7 @@ from contextlib import ExitStack
 from pathlib import Path
 
 import numpy as np
+from paddleocr_vl_tasks import task_for_prompt
 
 MAX_LOGIT_ABS_ERROR = 1.0
 MEAN_LOGIT_ABS_ERROR = 0.2
@@ -221,7 +222,7 @@ def merge(
 
     validate_inputs(base_model, adapter_dir, output_dir)
     if not fixture_jsonl.is_file():
-        raise FileNotFoundError(f"OCR fixture JSONL not found: {fixture_jsonl}")
+        raise FileNotFoundError(f"Task fixture JSONL not found: {fixture_jsonl}")
     paddle.set_device("gpu:0" if paddle.device.is_compiled_with_cuda() else "cpu")
     paddle.set_default_dtype("bfloat16")
     config = PaddleOCRVLConfig.from_pretrained(str(base_model.resolve()))
@@ -252,8 +253,15 @@ def merge(
             if line.strip()
         )
     )
-    if fixture_row.get("text_info", [{}])[0] != {"text": "OCR:", "tag": "mask"}:
-        raise ValueError("Merge fixture must use exactly the masked OCR: prompt")
+    prompt_row = fixture_row.get("text_info", [{}])[0]
+    if (
+        not isinstance(prompt_row, dict)
+        or prompt_row.get("tag") != "mask"
+        or not isinstance(prompt_row.get("text"), str)
+    ):
+        raise ValueError("Merge fixture must include a masked prompt in text_info[0]")
+    prompt = prompt_row["text"]
+    task = task_for_prompt(prompt)
     fixture_image = fixture_jsonl.parent / fixture_row["image_info"][0]["image_url"]
     image_processor = SiglipImageProcessor.from_pretrained(str(base_model.resolve()))
     image_processor.min_pixels = min_pixels
@@ -269,7 +277,7 @@ def merge(
         int(np.prod(image_grid_thw.numpy()[0])) // image_processor.merge_size**2
     )
     prompt_ids = tokenizer.encode(
-        "OCR:", add_special_tokens=False, return_attention_mask=False
+        prompt, add_special_tokens=False, return_attention_mask=False
     )["input_ids"]
     fixture_inputs = {
         "input_ids": paddle.to_tensor(
@@ -329,7 +337,8 @@ def merge(
     logits_report: dict[str, object] = {
         "status": "passed",
         "fixture": str(fixture_image.resolve()),
-        "prompt": "OCR:",
+        "task": task,
+        "prompt": prompt,
         "max_abs_error_tolerance": MAX_LOGIT_ABS_ERROR,
         "mean_abs_error_tolerance": MEAN_LOGIT_ABS_ERROR,
         "adapter_vs_in_memory_merge": compare_logits(

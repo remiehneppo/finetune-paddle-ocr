@@ -28,9 +28,10 @@ import yaml
 from PIL import Image, UnidentifiedImageError
 
 import finetune as rec_loader
+from paddleocr_vl_tasks import TASK_PROMPTS, prompt_for_task, resolve_row_task, task_for_prompt
 
 LOGGER = logging.getLogger("paddleocr_vl_vi_finetune")
-PROMPT = "OCR:"
+PROMPT = TASK_PROMPTS["ocr"]
 DEFAULT_MODEL = "PaddlePaddle/PaddleOCR-VL-1.6"
 DEFAULT_MIN_PIXELS = 64 * 28 * 28
 DEFAULT_MAX_PIXELS = 576 * 28 * 28
@@ -60,11 +61,27 @@ select_splits = rec_loader.select_splits
 normalize_text = rec_loader.normalize_text
 
 
+def normalize_target(row: Mapping[str, Any], task: str = "ocr") -> str:
+    if task == "ocr":
+        return normalize_text(row)
+    value: str | None = None
+    for column in ("label", "text"):
+        candidate = row.get(column)
+        if isinstance(candidate, str) and candidate.strip():
+            value = candidate
+            break
+    if value is None:
+        return ""
+    value = unicodedata.normalize("NFC", value)
+    return value.replace("\r\n", "\n").replace("\r", "\n").strip()
+
+
 @dataclass(frozen=True)
 class PreparedSample:
     image_path: str
     text: str
     dataset_index: int
+    prompt: str = PROMPT
 
 
 @dataclass(frozen=True)
@@ -119,7 +136,20 @@ class RejectionReport:
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Prepare crop OCR datasets and LoRA fine-tune PaddleOCR-VL-1.6 with ERNIEKit."
+        description=(
+            "Prepare OCR/layout datasets and LoRA fine-tune PaddleOCR-VL-1.6 with "
+            "ERNIEKit. Mix ocr/table/formula/chart in one run via a per-sample "
+            "'task' column; targets stay in the dataset text/label fields."
+        )
+    )
+    parser.add_argument(
+        "--task",
+        choices=tuple(TASK_PROMPTS),
+        default="ocr",
+        help=(
+            "Default task prompt for rows without a 'task' column. "
+            "Use a dataset 'task' column to mix layout types in one run."
+        ),
     )
     parser.add_argument("--dataset-dir", type=Path, nargs="+")
     parser.add_argument(
@@ -172,6 +202,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 
 
 def validate_args(args: argparse.Namespace) -> None:
+    prompt_for_task(args.task)
     has_datasets = bool(args.dataset_dir)
     has_prepared = args.prepared_from is not None
     if has_datasets and has_prepared:
@@ -278,8 +309,8 @@ def require_local_model_snapshot(model: str) -> Path:
     return path
 
 
-def count_tokens(tokenizer: Any, text: str) -> int:
-    combined = f"{PROMPT}{text}"
+def count_tokens(tokenizer: Any, text: str, prompt: str = PROMPT) -> int:
+    combined = f"{prompt}{text}"
     if hasattr(tokenizer, "encode"):
         return len(tokenizer.encode(combined, add_special_tokens=True))
     encoded = tokenizer(combined, add_special_tokens=True)
@@ -296,8 +327,10 @@ def visual_token_reserve(
     return math.ceil(max_pixels / token_area) + 2
 
 
-def total_multimodal_tokens(tokenizer: Any, text: str, *, visual_tokens: int) -> int:
-    return count_tokens(tokenizer, text) + visual_tokens
+def total_multimodal_tokens(
+    tokenizer: Any, text: str, *, visual_tokens: int, prompt: str = PROMPT
+) -> int:
+    return count_tokens(tokenizer, text, prompt) + visual_tokens
 
 
 def selected_devices(value: str) -> tuple[str, ...]:
@@ -358,6 +391,7 @@ def process_split(
     tokenizer: Any,
     report: RejectionReport,
     visual_tokens: int = 0,
+    default_task: str = "ocr",
 ) -> list[PreparedSample]:
     columns = set(getattr(split, "column_names", []))
     if columns and "image" not in columns:
@@ -374,15 +408,25 @@ def process_split(
                 dataset_dir, split_name, row_index, "row_load_error", str(exc)
             )
             continue
-        text = normalize_text(row)
+        try:
+            task = resolve_row_task(row, default_task)
+        except (TypeError, ValueError) as exc:
+            report.reject(dataset_dir, split_name, row_index, "invalid_task", str(exc))
+            continue
+        prompt = prompt_for_task(task)
+        text = normalize_target(row, task)
         if not text:
             report.reject(dataset_dir, split_name, row_index, "empty_text")
             continue
-        if any(unicodedata.category(character) == "Cc" for character in text):
+        if any(
+            unicodedata.category(character) == "Cc"
+            and not (task != "ocr" and character == "\n")
+            for character in text
+        ):
             report.reject(dataset_dir, split_name, row_index, "control_character")
             continue
         token_count = total_multimodal_tokens(
-            tokenizer, text, visual_tokens=visual_tokens
+            tokenizer, text, visual_tokens=visual_tokens, prompt=prompt
         )
         if token_count > max_seq_len:
             report.reject(
@@ -415,7 +459,9 @@ def process_split(
         except (OSError, ValueError, TypeError, UnidentifiedImageError) as exc:
             report.reject(dataset_dir, split_name, row_index, "invalid_image", str(exc))
             continue
-        samples.append(PreparedSample(relative_path.as_posix(), text, dataset_index))
+        samples.append(
+            PreparedSample(relative_path.as_posix(), text, dataset_index, prompt)
+        )
     return samples
 
 
@@ -437,7 +483,7 @@ def erniekit_payload(sample: PreparedSample) -> dict[str, Any]:
     return {
         "image_info": [{"image_url": sample.image_path, "matched_text_index": 0}],
         "text_info": [
-            {"text": PROMPT, "tag": "mask"},
+            {"text": sample.prompt, "tag": "mask"},
             {"text": sample.text, "tag": "no_mask"},
         ],
     }
@@ -447,12 +493,16 @@ def write_erniekit_jsonl(path: Path, samples: Iterable[PreparedSample]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8", newline="\n") as file:
         for sample in samples:
-            file.write(json.dumps(erniekit_payload(sample), ensure_ascii=False) + "\n")
+            file.write(
+                json.dumps(erniekit_payload(sample), ensure_ascii=False) + "\n"
+            )
 
 
 def prepare_datasets(
     args: argparse.Namespace, work_dir: Path, tokenizer: Any
 ) -> dict[str, Any]:
+    default_task = getattr(args, "task", "ocr")
+    observed_tasks: set[str] = set()
     work_dir.mkdir(parents=True, exist_ok=True)
     prepared_dir = work_dir / "prepared"
     prepared_dir.mkdir(parents=True, exist_ok=True)
@@ -475,7 +525,9 @@ def prepare_datasets(
                 tokenizer,
                 report,
                 visual_token_reserve(args.max_pixels),
+                default_task,
             )
+            observed_tasks.update(task_for_prompt(sample.prompt) for sample in train_samples)
             if validation_split is None:
                 train_samples, validation_samples = split_train_validation(
                     train_samples,
@@ -495,7 +547,11 @@ def prepare_datasets(
                     tokenizer,
                     report,
                     visual_token_reserve(args.max_pixels),
+                    default_task,
                 )
+            observed_tasks.update(
+                task_for_prompt(sample.prompt) for sample in validation_samples
+            )
             if not train_samples:
                 raise ValueError(f"No valid training samples remain for {dataset_dir}")
             if not validation_samples:
@@ -528,7 +584,8 @@ def prepare_datasets(
             [source["validation_samples"] for source in source_summaries]
         )
         summary = {
-            "prompt": PROMPT,
+            "tasks": sorted(observed_tasks),
+            "prompts": [prompt_for_task(task) for task in sorted(observed_tasks)],
             "model": getattr(args, "model", DEFAULT_MODEL),
             "sources": source_summaries,
             "train_samples": sum(
@@ -541,6 +598,12 @@ def prepare_datasets(
             "validation_probabilities": validation_probabilities,
             "rejected": dict(sorted(report.counts.items())),
         }
+        if len(observed_tasks) == 1:
+            only_task = next(iter(observed_tasks))
+            summary["task"] = only_task
+            summary["prompt"] = prompt_for_task(only_task)
+        else:
+            summary["task"] = "mixed"
     (work_dir / "summary.json").write_text(
         json.dumps(summary, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
     )
@@ -556,9 +619,21 @@ def _resolve_reused_path(value: Any, base_dir: Path, field: str) -> Path:
     return path.resolve()
 
 
-def _validate_prepared_jsonl(path: Path) -> int:
+def _validate_prepared_jsonl(
+    path: Path, allowed_prompts: Sequence[str] | None = None
+) -> int:
     if not path.is_file():
         raise FileNotFoundError(f"Prepared JSONL not found: {path}")
+
+    allowed = (
+        set(TASK_PROMPTS.values())
+        if allowed_prompts is None
+        else set(allowed_prompts)
+    )
+    if not allowed:
+        raise ValueError(
+            "Prepared JSONL validation requires at least one allowed prompt"
+        )
 
     count = 0
     with path.open(encoding="utf-8") as file:
@@ -579,17 +654,20 @@ def _validate_prepared_jsonl(path: Path) -> int:
             if not isinstance(text_info, list) or len(text_info) != 2:
                 raise ValueError(f"Invalid text_info contract in {path}:{line_number}")
             image = image_info[0]
-            prompt, target = text_info
+            prompt_row, target = text_info
             if (
                 not isinstance(image, Mapping)
                 or image.get("matched_text_index") != 0
-                or prompt != {"text": PROMPT, "tag": "mask"}
+                or not isinstance(prompt_row, Mapping)
+                or prompt_row.get("tag") != "mask"
+                or not isinstance(prompt_row.get("text"), str)
+                or prompt_row["text"] not in allowed
                 or not isinstance(target, Mapping)
                 or target.get("tag") != "no_mask"
                 or not isinstance(target.get("text"), str)
                 or not target["text"]
             ):
-                raise ValueError(f"Invalid OCR mask contract in {path}:{line_number}")
+                raise ValueError(f"Invalid task mask contract in {path}:{line_number}")
 
             image_path = _resolve_reused_path(
                 image.get("image_url"), path.parent, "image_url"
@@ -602,7 +680,48 @@ def _validate_prepared_jsonl(path: Path) -> int:
     return count
 
 
-def load_prepared_run(prepared_from: Path, work_dir: Path) -> dict[str, Any]:
+def _normalize_summary_tasks(summary: dict[str, Any]) -> list[str]:
+    raw_tasks = summary.get("tasks")
+    if isinstance(raw_tasks, list) and raw_tasks:
+        normalized: list[str] = []
+        for task in raw_tasks:
+            if not isinstance(task, str):
+                raise TypeError("Prepared summary tasks must be strings")
+            prompt_for_task(task)
+            normalized.append(task)
+        tasks = sorted(set(normalized))
+    else:
+        legacy_task = summary.get("task", "ocr")
+        if legacy_task == "mixed":
+            raise ValueError("Prepared summary task='mixed' requires a non-empty tasks list")
+        if not isinstance(legacy_task, str):
+            raise TypeError("Prepared summary task must be a string")
+        prompt_for_task(legacy_task)
+        tasks = [legacy_task]
+
+    prompts = [prompt_for_task(task) for task in tasks]
+    if "prompt" in summary and summary["prompt"] not in prompts:
+        raise ValueError(
+            f"Prepared summary prompt {summary['prompt']!r} does not match tasks {tasks}"
+        )
+    if "prompts" in summary:
+        recorded = summary["prompts"]
+        if not isinstance(recorded, list) or set(recorded) != set(prompts):
+            raise ValueError("Prepared summary prompts do not match tasks")
+    summary["tasks"] = tasks
+    summary["prompts"] = prompts
+    if len(tasks) == 1:
+        summary["task"] = tasks[0]
+        summary["prompt"] = prompts[0]
+    else:
+        summary["task"] = "mixed"
+        summary.pop("prompt", None)
+    return tasks
+
+
+def load_prepared_run(
+    prepared_from: Path, work_dir: Path
+) -> dict[str, Any]:
     prepared_run = prepared_from.expanduser().resolve()
     summary_path = prepared_run / "summary.json"
     if not summary_path.is_file():
@@ -613,8 +732,8 @@ def load_prepared_run(prepared_from: Path, work_dir: Path) -> dict[str, Any]:
         raise ValueError(f"Invalid prepared summary: {summary_path}") from exc
     if not isinstance(summary, dict):
         raise TypeError(f"Prepared summary must be a JSON object: {summary_path}")
-    if summary.get("prompt") != PROMPT:
-        raise ValueError(f"Prepared summary prompt must be exactly {PROMPT!r}")
+    tasks = _normalize_summary_tasks(summary)
+    allowed_prompts = [prompt_for_task(task) for task in tasks]
 
     sources = summary.get("sources")
     if not isinstance(sources, list) or not sources:
@@ -638,7 +757,7 @@ def load_prepared_run(prepared_from: Path, work_dir: Path) -> dict[str, Any]:
             jsonl_path = _resolve_reused_path(
                 source.get(path_field), prepared_run, path_field
             )
-            actual_count = _validate_prepared_jsonl(jsonl_path)
+            actual_count = _validate_prepared_jsonl(jsonl_path, allowed_prompts)
             expected_count = source.get(count_field)
             if not isinstance(expected_count, int) or expected_count <= 0:
                 raise ValueError(
@@ -1401,10 +1520,16 @@ def _load_existing_run(work_dir: Path) -> tuple[dict[str, Any], Path]:
         raise FileNotFoundError(
             "Resume run is missing summary.json or resolved.yaml; refusing to overwrite it"
         )
-    return json.loads(summary_path.read_text(encoding="utf-8")), config_path
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    if not isinstance(summary, dict):
+        raise TypeError(f"Run summary must be a JSON object: {summary_path}")
+    _normalize_summary_tasks(summary)
+    return summary, config_path
 
 
-def main(argv: Sequence[str] | None = None) -> int:
+def main(
+    argv: Sequence[str] | None = None,
+) -> int:
     args = parse_args(argv)
     validate_args(args)
     work_dir = make_work_dir(args.work_dir, args.resume_from)
@@ -1555,3 +1680,10 @@ if __name__ == "__main__":
         level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s"
     )
     raise SystemExit(main())
+    allowed = (
+        set(TASK_PROMPTS.values())
+        if allowed_prompts is None
+        else set(allowed_prompts)
+    )
+    if not allowed:
+        raise ValueError("Prepared JSONL validation requires at least one allowed prompt")

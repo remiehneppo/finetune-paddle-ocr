@@ -4,7 +4,9 @@ Pipeline LoRA cho **PaddleOCR-VL-1.6** được tài liệu riêng tại
 [docs/finetune-paddleocr-vl-1.6.md](docs/finetune-paddleocr-vl-1.6.md). Pipeline
 này dùng ERNIEKit và môi trường tách biệt với PP-OCRv6 bên dưới. Dataset VL đã
 prepare có thể dùng lại bằng `finetune_vl.py --prepared-from <prepare-run>` mà
-không sao chép hoặc xử lý lại ảnh.
+không sao chép hoặc xử lý lại ảnh. OCR/table/formula/chart dùng chung
+`finetune_vl.py`; trộn nhiều layout trong một run qua cột `task` trong dataset
+để hạn chế phá các khả năng layout khác.
 
 Script này fine-tune **text recognition** (ảnh crop chứa một từ/dòng chữ), không phải text detection trên ảnh trang đầy đủ. Nó nhận nhiều Hugging Face dataset đã `save_to_disk()` hoặc snapshot tải từ Hub có `data/*.parquet`, mỗi sample có:
 
@@ -217,3 +219,61 @@ thay vì âm thầm chuyển sang CPU.
 Vì đây là công cụ local không có cơ chế đăng nhập, `--host` chỉ chấp nhận
 `localhost` hoặc địa chỉ loopback IPv4/IPv6 (ví dụ `127.0.0.1`, `::1`);
 `0.0.0.0` và địa chỉ LAN/public bị từ chối.
+
+## Dịch vụ gán nhãn layout cho PaddleOCR-VL 1.6
+
+`run_vl_layout_labeler.py` là service riêng cho pipeline train-oriented:
+`PP-DocLayoutV3` local phát hiện layout, người dùng kiểm tra/sửa bbox và task,
+`llama-server` prelabel text theo crop, rồi export Hugging Face dataset có ba
+cột `image`, `text`, `task`. Tool không sửa ảnh nguồn và không dùng sidecar của
+hai labeler phía trên.
+
+```bash
+source .venv/bin/activate
+python -m pip install -r requirements-labeler.txt
+python run_vl_layout_labeler.py \
+  --images /path/to/images \
+  --layout-model-dir /home/tieubaoca/.paddlex/official_models/PP-DocLayoutV3 \
+  --vl-base-url http://127.0.0.1:8000/v1 \
+  --vl-model paddleocr-vl \
+  --device gpu:0
+```
+
+Mở `http://127.0.0.1:8012`. Service fail-fast nếu layout model hoặc endpoint
+VL không sẵn sàng, chỉ dùng một GPU queue và chỉ bind loopback. Sidecar riêng
+được lưu tại `<folder ảnh>/.paddleocr-vl-labeler/annotations/`. Sidecar version
+2 giữ đủ 25 class theo đúng thứ tự PP-DocLayoutV3. `table`, `chart`,
+`display_formula`/`inline_formula` được map lần lượt sang `table`, `chart`,
+`formula`; các class văn bản map sang `ocr`, còn class layout-only giữ bbox với
+`task=null` và không gửi tới VL.
+
+Quy trình: `Detect ảnh` hoặc `Detect folder` → chọn block → `Prelabel chọn`/
+`Prelabel ảnh` → sửa layout label/task/text/bbox → `Complete`. `Export HF` chỉ
+lấy block completed, không skip, có task VL và text không rỗng. `Export Layout`
+tạo COCO instance segmentation từ toàn trang; `Export All` tạo nguyên tử hai
+nhánh `<output>/vl/` và `<output>/layout/`. Mỗi export cần tối thiểu hai sample
+hoặc hai trang hợp lệ để tạo train/validation.
+
+```bash
+python finetune_vl.py --prepare-only \
+  --dataset-dir /path/to/export/vl \
+  --model /path/to/PaddleOCR-VL-1.6 \
+  --work-dir runs/vl16_layout_prepare
+```
+
+Kiểm tra và train nhánh layout bằng cấu hình PaddleX cài cùng môi trường:
+
+```bash
+PADDLEX_CONFIG=.venv/lib/python3.12/site-packages/paddlex/configs/modules/layout_analysis/PP-DocLayoutV3.yaml
+
+.venv/bin/python -c 'from paddlex.engine import Engine; Engine().run()' \
+  -c "$PADDLEX_CONFIG" \
+  -o Global.mode=check_dataset \
+  -o Global.dataset_dir=/path/to/export/layout
+
+.venv/bin/python -c 'from paddlex.engine import Engine; Engine().run()' \
+  -c "$PADDLEX_CONFIG" \
+  -o Global.mode=train \
+  -o Global.dataset_dir=/path/to/export/layout \
+  -o Train.num_classes=25
+```

@@ -423,6 +423,7 @@ class FinetuneVLTests(unittest.TestCase):
                     "dataset": "source-007",
                     "image": str(image.resolve()),
                     "target": "một",
+                    "prompt": "OCR:",
                 }
             ],
         )
@@ -1191,6 +1192,7 @@ class FinetuneVLTests(unittest.TestCase):
             "--min-pixels",
             "--max-pixels",
             "--max-checkpoints",
+            "--task",
         ):
             self.assertNotIn(obsolete, command)
 

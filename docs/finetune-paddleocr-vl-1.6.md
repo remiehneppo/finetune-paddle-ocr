@@ -1,8 +1,11 @@
 # Fine-tune PaddleOCR-VL-1.6 tiếng Việt bằng ERNIEKit LoRA
 
-Pipeline này dành cho ảnh crop dòng hoặc vùng chữ. Mọi sample chỉ dùng prompt
-`OCR:`; ground truth được train, prompt và image token được mask. Backend là
-stage `OCR-VL-SFT` của ERNIEKit, không gọi `PaddleOCR/tools/train.py`.
+Pipeline này dành cho ảnh crop dòng, bảng, công thức hoặc biểu đồ trên cùng
+một script `finetune_vl.py`. Mỗi sample lấy ground truth từ cột `label`/`text`
+của dataset đã chỉ định; script không chuyển đổi format target. Prompt theo
+task (`OCR:`, `Table Recognition:`, `Formula Recognition:`,
+`Chart Recognition:`) và image token được mask. Backend là stage `OCR-VL-SFT`
+của ERNIEKit, không gọi `PaddleOCR/tools/train.py`.
 
 ## Môi trường tách biệt
 
@@ -53,8 +56,11 @@ MODEL=/home/tieubaoca/AI/models/paddleocr-cache/official_models/PaddleOCR-VL-1.6
 
 Input là một hoặc nhiều thư mục Hugging Face `save_to_disk()` hoặc snapshot
 Parquet có cột `image` và `label`/`text`. Nếu `label` rỗng, `text` được dùng làm
-fallback. Text được chuẩn hóa NFC. Ảnh phải giải mã thật, có hai chiều lớn hơn
-1 pixel, nằm dưới `--max-image-pixels`, và được materialize thành PNG RGB.
+fallback. Có thể thêm cột `task` với giá trị `ocr|table|formula|chart` để trộn
+nhiều loại trong một run; nếu thiếu cột này, dùng `--task` (mặc định `ocr`).
+Target giữ nguyên từ dataset đã chỉ định. OCR vẫn flatten whitespace; layout
+giữ newline. Ảnh phải giải mã thật, có hai chiều lớn hơn 1 pixel, nằm dưới
+`--max-image-pixels`, và được materialize thành PNG RGB.
 
 ```bash
 python finetune_vl.py \
@@ -68,12 +74,81 @@ Mỗi nguồn giữ validation riêng. Nếu nguồn chưa có `validation`, `va
 `dev`, script tách holdout với seed riêng cho nguồn. ERNIEKit nhận một JSONL cho
 mỗi nguồn và xác suất trộn chuẩn hóa theo `sqrt(số sample)`.
 
+### Trộn table, formula và chart
+
+Dùng chung `finetune_vl.py` và để target nằm sẵn trong dataset. Trộn nhiều
+layout trong một prepare/train để giảm nguy cơ LoRA làm hỏng các output layout
+khác. Mỗi sample cần cột `task`; JSONL ERNIEKit vẫn đặt ảnh khớp
+`text_info[0]`, prompt `mask`, target `no_mask`.
+
+```bash
+python finetune_vl.py \
+  --dataset-dir /data/layout_mixed \
+  --model "$MODEL" \
+  --work-dir runs/vl16_layout_mixed_prepare \
+  --prepare-only
+
+python finetune_vl.py \
+  --prepared-from runs/vl16_layout_mixed_prepare \
+  --erniekit-dir /opt/ERNIE \
+  --model "$MODEL" \
+  --work-dir runs/vl16_layout_mixed_train
+```
+
+Nếu một dataset chỉ có một loại và không có cột `task`, đặt
+`--task table|formula|chart` làm mặc định cho toàn bộ sample của run đó.
+
+### Tạo crop layout bằng VL Layout Labeler
+
+Tool `run_vl_layout_labeler.py` nằm ngoài `ocr_labeler/` và dùng sidecar riêng
+`.paddleocr-vl-labeler`. Sidecar version 2 giữ đủ 25 class PP-DocLayoutV3 và
+task VL nullable trên cùng block. Tool gửi riêng block có task
+`ocr|table|formula|chart` tới OpenAI-compatible `llama-server
+/v1/chat/completions` với `temperature=0`, đồng thời giữ block layout-only để
+export COCO instance segmentation.
+
+```bash
+python run_vl_layout_labeler.py \
+  --images /data/pages \
+  --layout-model-dir /home/tieubaoca/.paddlex/official_models/PP-DocLayoutV3 \
+  --vl-base-url http://127.0.0.1:8000/v1 \
+  --vl-model paddleocr-vl \
+  --port 8012
+```
+
+Trong UI, detect layout trước, prelabel từng vùng hoặc cả trang, sửa toàn bộ
+layout label/task/text/bbox rồi bấm `Complete`. `Export HF` giữ schema
+`image,text,task` và loại layout-only. `Export Layout` tạo `images/`, hai COCO
+JSON train/validation và manifest; ảnh toàn trang được sao chép byte-for-byte.
+`Export All` tạo nguyên tử `<root>/vl/` và `<root>/layout/`.
+
+Nhánh VL dùng trực tiếp với `--dataset-dir <root>/vl --prepare-only`. Nhánh
+layout kiểm tra/train bằng PaddleX 3.7.2 như sau:
+
+```bash
+PADDLEX_CONFIG=.venv/lib/python3.12/site-packages/paddlex/configs/modules/layout_analysis/PP-DocLayoutV3.yaml
+
+.venv/bin/python -c 'from paddlex.engine import Engine; Engine().run()' \
+  -c "$PADDLEX_CONFIG" \
+  -o Global.mode=check_dataset \
+  -o Global.dataset_dir=<root>/layout
+
+.venv/bin/python -c 'from paddlex.engine import Engine; Engine().run()' \
+  -c "$PADDLEX_CONFIG" \
+  -o Global.mode=train \
+  -o Global.dataset_dir=<root>/layout \
+  -o Train.num_classes=25
+```
+
 ### Dùng lại dataset đã prepare
 
 `--prepared-from` tạo run train mới nhưng tham chiếu trực tiếp JSONL và ảnh của
 run `--prepare-only` cũ. Script kiểm tra toàn bộ record, mask contract, số lượng
 sample và sự tồn tại của file ảnh; ảnh không bị giải mã lại hoặc sao chép. Vì
 vậy không được xóa hay di chuyển run prepare trong khi còn dùng checkpoint này.
+`summary.json` ghi `tasks`/`prompts` quan sát được; run mixed đặt
+`task=mixed`. Summary cũ không có `task` vẫn được hiểu là OCR. Evaluator và merge
+đọc prompt từ từng dòng JSONL, không khóa một task cho cả run.
 
 Với dataset và model hiện có trên máy này, chạy full LoRA bằng lệnh:
 
@@ -197,5 +272,6 @@ backend chưa cung cấp contract đó; checkpoints được giữ để so CER 
 
 ```bash
 PYTHONPATH=. pytest -q tests/test_finetune_vl.py tests/test_finetune.py
+PYTHONPATH=. pytest -q tests/test_finetune_vl_layout.py
 bash -n download_pretrained_models.sh
 ```
