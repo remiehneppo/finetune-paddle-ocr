@@ -9,10 +9,12 @@ import shutil
 import stat
 import tempfile
 import threading
+import unicodedata
 from datetime import datetime
 from pathlib import Path
 
 from PIL import Image
+from paddleocr_vl_tasks import validate_target_for_task
 
 from .catalog import ImageRecord, WorkspaceCatalog, _file_sha256
 from .geometry import (
@@ -240,60 +242,119 @@ class AnnotationStore:
         if output.exists():
             raise ExportError(f"export path already exists: {output}")
         output.parent.mkdir(parents=True, exist_ok=True)
-        rows: list[dict] = []
+        pages: list[dict] = []
         for record in catalog.list_images():
             annotation = self._load_saved(record)
             if annotation is None or annotation.status != "completed":
                 continue
             self._assert_source(record, annotation)
+            page_rows: list[dict] = []
             with Image.open(record.path) as source:
                 image = source.convert("RGB")
                 for block in sorted(annotation.blocks, key=lambda item: item.order):
-                    text = block.text.strip()
-                    if block.skipped or block.task is None or not text:
+                    text = unicodedata.normalize("NFC", block.text).replace(
+                        "\r\n", "\n"
+                    ).replace("\r", "\n")
+                    if block.skipped or block.task is None or not text.strip():
                         continue
+                    try:
+                        validate_target_for_task(text, block.task)
+                    except ValueError as exc:
+                        raise ExportError(
+                            f"invalid {block.task} target on {record.name} block "
+                            f"{block.id}: {exc}"
+                        ) from exc
                     crop = image.crop(
                         crop_box_from_polygon(block.polygon, image.width, image.height)
                     )
                     name = f"{Path(record.name).stem}-{block.order:04d}-{block.id}.png"
                     buffer = io.BytesIO()
                     crop.save(buffer, format="PNG")
-                    rows.append(
+                    page_rows.append(
                         {
                             "image": {"bytes": buffer.getvalue(), "path": name},
                             "name": name,
                             "text": text,
                             "task": block.task,
+                            "source_page_id": record.image_id,
                         }
                     )
-        if len(rows) < 2:
+            if page_rows:
+                pages.append({"record": record, "rows": page_rows})
+        if len(pages) < 2:
             raise ExportError(
-                "HF export requires at least two completed VL samples for train and validation"
+                "HF export requires at least two completed pages with valid VL samples"
             )
-        temporary_root = Path(tempfile.mkdtemp(prefix=".vl-layout-export-", dir=output.parent))
+        train_pages, validation_pages = split_layout_pages(pages)
+        split_rows = {
+            "train": [row for page in train_pages for row in page["rows"]],
+            "validation": [
+                row for page in validation_pages for row in page["rows"]
+            ],
+        }
+        temporary_root = Path(
+            tempfile.mkdtemp(prefix=".vl-layout-export-", dir=output.parent)
+        )
         dataset_dir = temporary_root / "dataset"
         try:
             try:
-                from datasets import Dataset, Features, Image as HFImage, Value
+                from datasets import (
+                    Dataset,
+                    DatasetDict,
+                    Features,
+                    Image as HFImage,
+                    Value,
+                )
             except ImportError as exc:
                 raise ExportError("datasets is required for HF export") from exc
-            dataset = Dataset.from_dict(
+            features = Features(
                 {
-                    "image": [row["image"] for row in rows],
-                    "text": [row["text"] for row in rows],
-                    "task": [row["task"] for row in rows],
-                },
-                features=Features(
-                    {"image": HFImage(), "text": Value("string"), "task": Value("string")}
-                ),
+                    "image": HFImage(),
+                    "text": Value("string"),
+                    "task": Value("string"),
+                    "source_page_id": Value("string"),
+                }
+            )
+            dataset = DatasetDict(
+                {
+                    split_name: Dataset.from_dict(
+                        {
+                            "image": [row["image"] for row in rows],
+                            "text": [row["text"] for row in rows],
+                            "task": [row["task"] for row in rows],
+                            "source_page_id": [
+                                row["source_page_id"] for row in rows
+                            ],
+                        },
+                        features=features,
+                    )
+                    for split_name, rows in split_rows.items()
+                }
             )
             dataset.save_to_disk(dataset_dir)
             crops_dir = dataset_dir / "crops"
             crops_dir.mkdir()
-            for row in rows:
-                (crops_dir / row["name"]).write_bytes(row["image"]["bytes"])
+            for rows in split_rows.values():
+                for row in rows:
+                    (crops_dir / row["name"]).write_bytes(row["image"]["bytes"])
             (dataset_dir / "vl_layout_labeler_export.json").write_text(
-                json.dumps({"samples": len(rows)}, ensure_ascii=False, indent=2),
+                json.dumps(
+                    {
+                        "samples": sum(len(rows) for rows in split_rows.values()),
+                        "pages": len(pages),
+                        "splits": {
+                            name: {
+                                "pages": len(train_pages)
+                                if name == "train"
+                                else len(validation_pages),
+                                "samples": len(rows),
+                            }
+                            for name, rows in split_rows.items()
+                        },
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                ),
                 encoding="utf-8",
             )
             os.replace(dataset_dir, output)
@@ -303,7 +364,13 @@ class AnnotationStore:
             raise
         finally:
             shutil.rmtree(temporary_root, ignore_errors=True)
-        return {"path": str(output), "samples": len(rows)}
+        return {
+            "path": str(output),
+            "samples": sum(len(rows) for rows in split_rows.values()),
+            "pages": len(pages),
+            "train_pages": len(train_pages),
+            "validation_pages": len(validation_pages),
+        }
 
     def _layout_page(self, record: ImageRecord, annotation: Annotation) -> dict | None:
         blocks = []

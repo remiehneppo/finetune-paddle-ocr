@@ -7,6 +7,10 @@ task (`OCR:`, `Table Recognition:`, `Formula Recognition:`,
 `Chart Recognition:`) và image token được mask. Backend là stage `OCR-VL-SFT`
 của ERNIEKit, không gọi `PaddleOCR/tools/train.py`.
 
+Contract target theo tài liệu ERNIEKit chính thức: table là **OTSL**
+(`<fcel>`, `<ecel>`, `<xcel>`, `<lcel>`, `<ucel>`, `<nl>`), formula là LaTeX,
+chart là bảng Markdown. HTML table bị từ chối thay vì train sai schema.
+
 ## Môi trường tách biệt
 
 Không cài ERNIEKit/PaddleOCR-VL vào virtualenv PP-OCRv6 hiện có.
@@ -46,6 +50,8 @@ Có thể pin revision khác rõ ràng:
 ```
 
 Sau đó luôn truyền model local để bước prepare/train không tải weights từ Hub.
+`--work-dir` và mọi merged output bắt buộc nằm ngoài snapshot model; script
+fail-closed nếu đường dẫn có thể ghi artifact vào thư mục base model.
 Trên máy hiện tại snapshot đã có tại:
 
 ```bash
@@ -57,14 +63,17 @@ MODEL=/home/tieubaoca/AI/models/paddleocr-cache/official_models/PaddleOCR-VL-1.6
 Input là một hoặc nhiều thư mục Hugging Face `save_to_disk()` hoặc snapshot
 Parquet có cột `image` và `label`/`text`. Nếu `label` rỗng, `text` được dùng làm
 fallback. Có thể thêm cột `task` với giá trị `ocr|table|formula|chart` để trộn
-nhiều loại trong một run; nếu thiếu cột này, dùng `--task` (mặc định `ocr`).
-Target giữ nguyên từ dataset đã chỉ định. OCR vẫn flatten whitespace; layout
-giữ newline. Ảnh phải giải mã thật, có hai chiều lớn hơn 1 pixel, nằm dưới
+nhiều loại trong một run. Với một nguồn thiếu cột này, dùng `--task` (mặc định
+`ocr`). Với nhiều nguồn có nguồn thiếu `task`, bắt buộc truyền một
+`--dataset-task` cho mỗi `--dataset-dir`; script không âm thầm gán tất cả nguồn
+thành OCR. Target giữ nguyên newline cho cả OCR và layout. Ảnh phải giải mã
+thật, có hai chiều lớn hơn 1 pixel, nằm dưới
 `--max-image-pixels`, và được materialize thành PNG RGB.
 
 ```bash
 python finetune_vl.py \
   --dataset-dir /data/ocr_a /data/ocr_b \
+  --dataset-task ocr ocr \
   --model "$MODEL" \
   --work-dir runs/vl16_vi_prepare \
   --prepare-only
@@ -95,8 +104,16 @@ python finetune_vl.py \
   --work-dir runs/vl16_layout_mixed_train
 ```
 
-Nếu một dataset chỉ có một loại và không có cột `task`, đặt
-`--task table|formula|chart` làm mặc định cho toàn bộ sample của run đó.
+Nếu một dataset duy nhất chỉ có một loại và không có cột `task`, đặt
+`--task table|formula|chart`. Nếu có nhiều dataset đơn-task, dùng mapping vị trí:
+
+```bash
+python finetune_vl.py --prepare-only \
+  --dataset-dir /data/ocr /data/formula /data/table \
+  --dataset-task ocr formula table \
+  --model "$MODEL" \
+  --work-dir runs/vl16_mixed_prepare
+```
 
 ### Tạo crop layout bằng VL Layout Labeler
 
@@ -117,10 +134,19 @@ python run_vl_layout_labeler.py \
 ```
 
 Trong UI, detect layout trước, prelabel từng vùng hoặc cả trang, sửa toàn bộ
-layout label/task/text/bbox rồi bấm `Complete`. `Export HF` giữ schema
-`image,text,task` và loại layout-only. `Export Layout` tạo `images/`, hai COCO
+layout label/task/text/bbox rồi bấm `Complete`. `Export HF` split theo trang
+trước khi flatten block crop, tạo `DatasetDict` `train`/`validation` với schema
+`image,text,task,source_page_id` và loại layout-only. Mọi block của cùng trang
+luôn ở cùng split. `Export Layout` tạo `images/`, hai COCO
 JSON train/validation và manifest; ảnh toàn trang được sao chép byte-for-byte.
 `Export All` tạo nguyên tử `<root>/vl/` và `<root>/layout/`.
+
+Editor output có hai tab đồng bộ: `Trực quan` và `Raw`. OCR được tách theo dòng;
+table được convert OTSL sang bảng HTML thật với `rowspan`/`colspan` để sửa và
+merge/split ô, rồi convert ngược về OTSL canonical; formula giữ nguyên LaTeX với
+preview; chart là bảng Markdown có căn lề. Sửa raw chỉ cập nhật
+visualize khi parse thành công; raw chưa hợp lệ vẫn được giữ nguyên để người dùng
+tiếp tục sửa. Cả frontend, bước `Complete` và export đều kiểm tra cùng contract.
 
 Nhánh VL dùng trực tiếp với `--dataset-dir <root>/vl --prepare-only`. Nhánh
 layout kiểm tra/train bằng PaddleX 3.7.2 như sau:
@@ -252,15 +278,26 @@ có đường làm tròn BF16 khác runtime adapter. Pipeline vì vậy dùng AP
 Hugging Face. Nó copy config, tokenizer, processor, custom model code,
 `chat_template.jinja`, `inference.yml` và generation config từ base local.
 
-Trước merge, evaluator greedy chấm base, adapter cuối và các checkpoint gần nhất
-bằng CER (exact match là tie-breaker), rồi chỉ merge checkpoint thắng.
+Trước export cuối, pipeline merge/evaluate tuần tự adapter cuối và tối đa
+`--eval-max-checkpoints` checkpoint gần nhất. Mỗi bản merge tạm được xác minh,
+chấm native rồi xóa; base prediction chỉ chạy một lần và được tái sử dụng cho
+mọi candidate. Checkpoint thắng được chọn theo CER, exact match và normalized
+edit distance, sau đó mới tạo `adapter/export` chính thức. Export mới được build
+và xác minh trong thư mục tạm; bản export cũ chỉ được thay sau khi toàn bộ gate
+thành công và được khôi phục nếu bước promote lỗi.
 `merge_verification.json` xác nhận công thức weight; `logits_verification.json`
 xác nhận model reload khớp bản merge trong RAM và drift BF16 nằm trong numeric
-tolerance. Pha đánh giá thứ hai so output của adapter đã chọn với merged model;
-`export_manifest.json` chỉ được công nhận khi normalized edit similarity đạt 0,99.
-Full run fail-fast nếu không đạt; smoke run vẫn ghi trạng thái để chẩn đoán model
-chưa học đủ. CER, exact match và normalized edit distance được báo tổng thể và
-theo từng nguồn.
+tolerance. Native evaluator báo CER, exact match và normalized edit distance
+tổng thể, theo nguồn và theo task. Mặc định merged model phải có NED >= 0,5,
+CER <= 1,0, không regression so với base ở từng metric, và không prediction nào
+chạm token limit khi chưa sinh EOS. Có thể chỉnh bằng
+`--min-normalized-edit-distance`, `--max-cer`, `--eval-max-new-tokens` và
+`--eval-task-max-new-tokens task=count`. Full run fail-fast nếu không checkpoint
+nào đạt; smoke run vẫn chọn bản tốt nhất nhưng manifest giữ trạng thái failed.
+
+Token budget prepare dùng đúng `smart_resize` của PaddleOCR-VL, grid ảnh
+`(H/14)*(W/14)/2^2`, token prompt/response không special token và một EOS. Sample
+vượt `--max-seq-len` bị reject; target không bao giờ bị truncate.
 
 Lưu ý về ERNIEKit `release/v1.5`: workflow `OCR-VL-SFT` chính thức hiện để
 `eval_dataset=None`, nên bật `do_eval` sẽ lỗi thay vì tạo validation loss. Config

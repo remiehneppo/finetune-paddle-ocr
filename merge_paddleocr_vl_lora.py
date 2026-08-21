@@ -27,6 +27,9 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 
 
 def validate_inputs(base_model: Path, adapter_dir: Path, output_dir: Path) -> None:
+    base_model = base_model.expanduser().resolve()
+    adapter_dir = adapter_dir.expanduser().resolve()
+    output_dir = output_dir.expanduser().resolve()
     config_path = base_model / "config.json"
     lora_config_path = adapter_dir / "lora_config.json"
     if not config_path.is_file():
@@ -36,6 +39,8 @@ def validate_inputs(base_model: Path, adapter_dir: Path, output_dir: Path) -> No
     config = json.loads(config_path.read_text(encoding="utf-8"))
     if config.get("model_type") != "paddleocr_vl":
         raise ValueError("Compatibility merge only supports model_type='paddleocr_vl'")
+    if output_dir == base_model or base_model in output_dir.parents:
+        raise ValueError("Merged output must be outside the immutable base model snapshot")
     if output_dir.exists() and any(output_dir.glob("*.safetensors")):
         raise FileExistsError(f"Merged model output already exists: {output_dir}")
 

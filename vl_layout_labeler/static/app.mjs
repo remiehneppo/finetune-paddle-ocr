@@ -1,8 +1,17 @@
+import {
+  TASK_FORMATS,
+  cloneTargetModel,
+  createStarterModel,
+  inspectTarget,
+  serializeTarget,
+} from "./target_codec.mjs";
+
 const $ = (id) => document.getElementById(id);
 const svg = (name) => document.createElementNS("http://www.w3.org/2000/svg", name);
 const state = {
   images: [], current: null, currentId: null, selected: null,
   view: { scale: 1, x: 0, y: 0 }, add: false, dirty: false, timer: null, drag: null,
+  targetMode: "visual", targetError: null,
 };
 
 async function api(path, options = {}) {
@@ -17,6 +26,12 @@ async function api(path, options = {}) {
 
 function setStatus(text) { $("save-status").textContent = text; }
 function selectedBlock() { return state.current?.blocks.find((block) => block.id === state.selected) || null; }
+function element(name, className, text) {
+  const value = document.createElement(name);
+  if (className) value.className = className;
+  if (text !== undefined) value.textContent = text;
+  return value;
+}
 function imageToScreen([x, y]) { return [x * state.view.scale + state.view.x, y * state.view.scale + state.view.y]; }
 function screenToImage([x, y]) { return [(x - state.view.x) / state.view.scale, (y - state.view.y) / state.view.scale]; }
 function rectangle(start, end) {
@@ -75,7 +90,7 @@ function renderBlocks() {
     const task = block.task || "layout-only";
     const content = block.task ? (block.text || "(chưa có text)") : block.layout_label;
     item.textContent = `${block.order + 1}. ${task} · ${content}`;
-    item.onclick = () => { state.selected = block.id; render(); };
+    item.onclick = () => { state.selected = block.id; state.targetError = null; render(); };
     list.append(item);
   }
 }
@@ -87,11 +102,363 @@ function renderInspector() {
   if (!block) return;
   $("layout-label").value = block.layout_label;
   $("task").value = block.task || "";
-  $("text").value = block.text;
-  $("text").disabled = block.task === null;
   $("layout-only-note").hidden = block.task !== null;
   $("skipped").checked = block.skipped;
   $("block-meta").textContent = `${block.source}${block.score == null ? "" : ` · ${(block.score * 100).toFixed(1)}%`}`;
+  renderTargetEditor();
+}
+
+function setTargetMessage(inspection) {
+  const message = $("target-message");
+  const error = state.targetError || inspection.error;
+  message.className = `target-message ${inspection.valid && !state.targetError ? "valid" : "error"}`;
+  message.textContent = error || "Output hợp lệ và đồng bộ với raw";
+}
+
+function targetButton(label, callback, className = "secondary") {
+  const button = element("button", className, label);
+  button.type = "button";
+  button.onclick = callback;
+  return button;
+}
+
+function markBlockEdited(block) {
+  markManual(block);
+  if (state.current.status === "completed") state.current.status = "edited";
+  renderBlocks();
+  markDirty();
+}
+
+function commitVisualModel(task, model, { rerender = false } = {}) {
+  const block = selectedBlock();
+  if (!block || block.task !== task) return false;
+  try {
+    const raw = serializeTarget(task, model);
+    block.text = raw;
+    $("text").value = raw;
+    state.targetError = null;
+    markBlockEdited(block);
+    if (rerender) renderTargetEditor();
+    else setTargetMessage(inspectTarget(task, raw));
+    return true;
+  } catch (error) {
+    state.targetError = `Không áp dụng thay đổi: ${error.message}`;
+    renderTargetEditor();
+    return false;
+  }
+}
+
+function renderOcrEditor(container, model) {
+  const list = element("div", "line-editor");
+  model.lines.forEach((line, index) => {
+    const row = element("div", "line-row");
+    row.append(element("span", "line-number", String(index + 1)));
+    const input = element("input");
+    input.value = line;
+    input.setAttribute("aria-label", `Dòng OCR ${index + 1}`);
+    input.oninput = (event) => {
+      model.lines[index] = event.target.value;
+      commitVisualModel("ocr", model);
+    };
+    row.append(input, targetButton("Xóa", () => {
+      if (model.lines.length === 1) return;
+      model.lines.splice(index, 1);
+      commitVisualModel("ocr", model, { rerender: true });
+    }, "icon danger"));
+    list.append(row);
+  });
+  container.append(list, targetButton("+ Thêm dòng", () => {
+    model.lines.push("");
+    commitVisualModel("ocr", model, { rerender: true });
+  }));
+}
+
+function renderFormulaEditor(container, model) {
+  const input = element("textarea", "formula-input");
+  const preview = element("div", "formula-preview");
+  input.value = model.text;
+  input.spellcheck = false;
+  input.setAttribute("aria-label", "LaTeX công thức");
+  const refresh = () => {
+    preview.textContent = model.text || "Công thức chưa có nội dung";
+    preview.classList.toggle("empty", !model.text);
+  };
+  input.oninput = (event) => {
+    model.text = event.target.value;
+    refresh();
+    commitVisualModel("formula", model);
+  };
+  refresh();
+  container.append(
+    element("p", "editor-hint", "LaTeX được giữ nguyên từng ký tự; khung dưới giúp kiểm tra nhanh output."),
+    input,
+    preview,
+  );
+}
+
+function renderOtslEditor(container, model) {
+  const wrapper = element("div", "table-scroll");
+  const table = element("table", "html-table-editor");
+  const body = element("tbody");
+  const mergeText = (first, second) => [first, second].filter(Boolean).join("\n");
+  const merge = (cell, direction) => {
+    const adjacent = direction === "right"
+      ? model.cells.find((candidate) => (
+        candidate.row === cell.row
+        && candidate.column === cell.column + cell.colspan
+        && candidate.rowspan === cell.rowspan
+      ))
+      : model.cells.find((candidate) => (
+        candidate.row === cell.row + cell.rowspan
+        && candidate.column === cell.column
+        && candidate.colspan === cell.colspan
+      ));
+    if (!adjacent) return;
+    const next = cloneTargetModel(model);
+    const target = next.cells.find(
+      (candidate) => candidate.row === cell.row && candidate.column === cell.column,
+    );
+    target.text = mergeText(target.text, adjacent.text);
+    if (direction === "right") target.colspan += adjacent.colspan;
+    else target.rowspan += adjacent.rowspan;
+    next.cells = next.cells.filter(
+      (candidate) => candidate.row !== adjacent.row || candidate.column !== adjacent.column,
+    );
+    commitVisualModel("table", next, { rerender: true });
+  };
+  const split = (cell) => {
+    const next = cloneTargetModel(model);
+    next.cells = next.cells.filter(
+      (candidate) => candidate.row !== cell.row || candidate.column !== cell.column,
+    );
+    for (let rowOffset = 0; rowOffset < cell.rowspan; rowOffset += 1) {
+      for (let columnOffset = 0; columnOffset < cell.colspan; columnOffset += 1) {
+        next.cells.push({
+          row: cell.row + rowOffset,
+          column: cell.column + columnOffset,
+          rowspan: 1,
+          colspan: 1,
+          text: rowOffset === 0 && columnOffset === 0 ? cell.text : "",
+        });
+      }
+    }
+    commitVisualModel("table", next, { rerender: true });
+  };
+  for (let rowIndex = 0; rowIndex < model.rowCount; rowIndex += 1) {
+    const row = element("tr");
+    const cells = model.cells
+      .filter((cell) => cell.row === rowIndex)
+      .sort((left, right) => left.column - right.column);
+    cells.forEach((cell) => {
+      const holder = element("td");
+      holder.rowSpan = cell.rowspan;
+      holder.colSpan = cell.colspan;
+      const input = element("textarea", "cell-input");
+      input.value = cell.text;
+      input.placeholder = "Nội dung ô";
+      input.setAttribute("aria-label", `Nội dung hàng ${rowIndex + 1}, cột ${cell.column + 1}`);
+      input.oninput = (event) => {
+        cell.text = event.target.value;
+        commitVisualModel("table", model);
+      };
+      const actions = element("div", "cell-actions");
+      const mergeRight = targetButton("Gộp →", () => merge(cell, "right"), "icon");
+      mergeRight.disabled = !model.cells.some((candidate) => (
+        candidate.row === cell.row
+        && candidate.column === cell.column + cell.colspan
+        && candidate.rowspan === cell.rowspan
+      ));
+      const mergeDown = targetButton("Gộp ↓", () => merge(cell, "down"), "icon");
+      mergeDown.disabled = !model.cells.some((candidate) => (
+        candidate.row === cell.row + cell.rowspan
+        && candidate.column === cell.column
+        && candidate.colspan === cell.colspan
+      ));
+      const splitCell = targetButton("Tách", () => split(cell), "icon");
+      splitCell.disabled = cell.rowspan === 1 && cell.colspan === 1;
+      actions.append(mergeRight, mergeDown, splitCell);
+      const span = element(
+        "span",
+        "cell-span",
+        cell.rowspan > 1 || cell.colspan > 1 ? `${cell.rowspan}×${cell.colspan}` : "",
+      );
+      holder.append(input, actions, span);
+      row.append(holder);
+    });
+    body.append(row);
+  }
+  table.append(body);
+  wrapper.append(table);
+  const controls = element("div", "grid-actions");
+  controls.append(
+    targetButton("+ Hàng", () => {
+      const next = cloneTargetModel(model);
+      for (let column = 0; column < next.columnCount; column += 1) {
+        next.cells.push({
+          row: next.rowCount, column, rowspan: 1, colspan: 1, text: "",
+        });
+      }
+      next.rowCount += 1;
+      commitVisualModel("table", next, { rerender: true });
+    }),
+    targetButton("+ Cột", () => {
+      const next = cloneTargetModel(model);
+      for (let row = 0; row < next.rowCount; row += 1) {
+        next.cells.push({
+          row, column: next.columnCount, rowspan: 1, colspan: 1, text: "",
+        });
+      }
+      next.columnCount += 1;
+      commitVisualModel("table", next, { rerender: true });
+    }),
+    targetButton("− Hàng cuối", () => {
+      if (model.rowCount === 1) return;
+      const lastRow = model.rowCount - 1;
+      const next = cloneTargetModel(model);
+      next.cells = next.cells.flatMap((cell) => {
+        if (cell.row === lastRow) return [];
+        if (cell.row + cell.rowspan - 1 === lastRow) return [{ ...cell, rowspan: cell.rowspan - 1 }];
+        return [cell];
+      });
+      next.rowCount -= 1;
+      commitVisualModel("table", next, { rerender: true });
+    }, "secondary danger"),
+    targetButton("− Cột cuối", () => {
+      if (model.columnCount === 1) return;
+      const lastColumn = model.columnCount - 1;
+      const next = cloneTargetModel(model);
+      next.cells = next.cells.flatMap((cell) => {
+        if (cell.column === lastColumn) return [];
+        if (cell.column + cell.colspan - 1 === lastColumn) return [{ ...cell, colspan: cell.colspan - 1 }];
+        return [cell];
+      });
+      next.columnCount -= 1;
+      commitVisualModel("table", next, { rerender: true });
+    }, "secondary danger"),
+  );
+  container.append(
+    element("p", "editor-hint", "Bảng HTML được chuyển hai chiều với OTSL. Gộp/tách ô tương ứng với rowspan và colspan."),
+    wrapper,
+    controls,
+  );
+}
+
+function renderChartEditor(container, model) {
+  const wrapper = element("div", "table-scroll");
+  const table = element("table", "target-grid chart-grid");
+  const header = element("thead");
+  const headerRow = element("tr");
+  const alignmentRow = element("tr", "alignment-row");
+  model.headers.forEach((value, columnIndex) => {
+    const cell = element("th");
+    const input = element("input");
+    input.value = value;
+    input.setAttribute("aria-label", `Tiêu đề cột ${columnIndex + 1}`);
+    input.oninput = (event) => {
+      model.headers[columnIndex] = event.target.value;
+      commitVisualModel("chart", model);
+    };
+    cell.append(input);
+    headerRow.append(cell);
+    const alignmentCell = element("th");
+    const select = element("select");
+    for (const [key, label] of [["none", "Mặc định"], ["left", "Trái"], ["center", "Giữa"], ["right", "Phải"]]) {
+      const option = element("option", "", label);
+      option.value = key;
+      option.selected = model.alignments[columnIndex] === key;
+      select.append(option);
+    }
+    select.onchange = (event) => {
+      model.alignments[columnIndex] = event.target.value;
+      commitVisualModel("chart", model);
+    };
+    alignmentCell.append(select);
+    alignmentRow.append(alignmentCell);
+  });
+  header.append(headerRow, alignmentRow);
+  const body = element("tbody");
+  model.rows.forEach((values, rowIndex) => {
+    const row = element("tr");
+    values.forEach((value, columnIndex) => {
+      const cell = element("td");
+      const input = element("input");
+      input.value = value;
+      input.setAttribute("aria-label", `Dữ liệu hàng ${rowIndex + 1}, cột ${columnIndex + 1}`);
+      input.oninput = (event) => {
+        model.rows[rowIndex][columnIndex] = event.target.value;
+        commitVisualModel("chart", model);
+      };
+      cell.append(input);
+      row.append(cell);
+    });
+    const action = element("td", "row-actions");
+    action.append(targetButton("Xóa", () => {
+      if (model.rows.length === 1) return;
+      const next = cloneTargetModel(model);
+      next.rows.splice(rowIndex, 1);
+      commitVisualModel("chart", next, { rerender: true });
+    }, "icon danger"));
+    row.append(action);
+    body.append(row);
+  });
+  table.append(header, body);
+  wrapper.append(table);
+  const controls = element("div", "grid-actions");
+  controls.append(
+    targetButton("+ Hàng", () => {
+      const next = cloneTargetModel(model);
+      next.rows.push(next.headers.map(() => ""));
+      commitVisualModel("chart", next, { rerender: true });
+    }),
+    targetButton("+ Cột", () => {
+      const next = cloneTargetModel(model);
+      next.headers.push(`Cột ${next.headers.length + 1}`);
+      next.alignments.push("none");
+      next.rows.forEach((row) => row.push(""));
+      commitVisualModel("chart", next, { rerender: true });
+    }),
+    targetButton("− Cột cuối", () => {
+      if (model.headers.length === 1) return;
+      const next = cloneTargetModel(model);
+      next.headers.pop();
+      next.alignments.pop();
+      next.rows.forEach((row) => row.pop());
+      commitVisualModel("chart", next, { rerender: true });
+    }, "secondary danger"),
+  );
+  container.append(wrapper, controls);
+}
+
+function renderTargetEditor() {
+  const block = selectedBlock();
+  const targetEditor = $("target-editor");
+  targetEditor.hidden = !block || block.task === null;
+  if (!block || block.task === null) return;
+  const inspection = inspectTarget(block.task, block.text);
+  $("target-format").textContent = `${TASK_FORMATS[block.task].label} · ${TASK_FORMATS[block.task].format}`;
+  $("text").value = block.text;
+  $("visual-tab").classList.toggle("active", state.targetMode === "visual");
+  $("raw-tab").classList.toggle("active", state.targetMode === "raw");
+  $("visual-tab").setAttribute("aria-selected", String(state.targetMode === "visual"));
+  $("raw-tab").setAttribute("aria-selected", String(state.targetMode === "raw"));
+  $("visual-tab").tabIndex = state.targetMode === "visual" ? 0 : -1;
+  $("raw-tab").tabIndex = state.targetMode === "raw" ? 0 : -1;
+  $("visual-panel").hidden = state.targetMode !== "visual";
+  $("raw-panel").hidden = state.targetMode !== "raw";
+  setTargetMessage(inspection);
+  $("starter-target").hidden = inspection.valid;
+  if (state.targetMode !== "visual") return;
+  const container = $("visual-editor");
+  container.replaceChildren();
+  if (!inspection.parseOk) {
+    container.append(element("div", "visual-unavailable", "Raw output chưa thể trực quan hóa. Sửa ở tab Raw hoặc tạo một mẫu mới."));
+    return;
+  }
+  const model = cloneTargetModel(inspection.model);
+  if (block.task === "ocr") renderOcrEditor(container, model);
+  else if (block.task === "formula") renderFormulaEditor(container, model);
+  else if (block.task === "table") renderOtslEditor(container, model);
+  else renderChartEditor(container, model);
 }
 
 function render() {
@@ -105,7 +472,7 @@ function render() {
     element.classList.add("bbox", block.task || "layout-only");
     if (block.id === state.selected) element.classList.add("selected");
     if (block.skipped) element.classList.add("skipped");
-    element.onclick = (event) => { event.stopPropagation(); state.selected = block.id; render(); };
+    element.onclick = (event) => { event.stopPropagation(); state.selected = block.id; state.targetError = null; render(); };
     element.onpointerdown = (event) => beginDrag(event, block);
     overlay.append(element);
     if (block.id === state.selected) {
@@ -134,6 +501,7 @@ async function loadImage(id) {
   state.current = await api(`/api/images/${id}/annotation`);
   state.currentId = id;
   state.selected = state.current.blocks[0]?.id || null;
+  state.targetError = null;
   $("current-name").textContent = state.images.find((item) => item.image_id === id)?.name || state.current.image.path;
   $("page-image").src = `/api/images/${id}/content?${Date.now()}`;
   $("page-image").onload = fitImage;
@@ -195,6 +563,7 @@ function beginDrag(event, block) {
   if (state.add) return;
   event.preventDefault();
   state.selected = block.id;
+  state.targetError = null;
   state.drag = { block, start: eventPoint(event), original: block.polygon.map((point) => [...point]) };
 }
 function beginCornerDrag(event, block, corner) {
@@ -243,6 +612,7 @@ $("page-stage").onpointerdown = (event) => {
           source: "manual", skipped: false,
         });
         state.selected = id;
+        state.targetError = null;
       });
     }
     state.add = false;
@@ -291,16 +661,66 @@ $("open-folder").onclick = async () => {
 $("detect-current").onclick = () => runCurrent("detect", { replace_existing: true });
 $("prelabel-page").onclick = () => runCurrent("prelabel", { block_ids: null, replace_existing: true });
 $("prelabel-current").onclick = () => runCurrent("prelabel", { block_ids: state.selected ? [state.selected] : null, replace_existing: true });
-$("complete-current").onclick = () => runCurrent("complete");
+$("complete-current").onclick = async () => {
+  const invalid = state.current?.blocks.find((block) => (
+    !block.skipped && block.task !== null && !inspectTarget(block.task, block.text).valid
+  ));
+  if (invalid) {
+    state.selected = invalid.id;
+    state.targetError = null;
+    render();
+    setStatus(`Chưa thể Complete: ${inspectTarget(invalid.task, invalid.text).error}`);
+    return;
+  }
+  await runCurrent("complete");
+};
 $("add-mode").onclick = () => { state.add = !state.add; $("add-mode").textContent = state.add ? "Hủy thêm bbox" : "Thêm bbox"; };
 $("delete-block").onclick = () => mutate(() => {
   state.current.blocks = state.current.blocks.filter((block) => block.id !== state.selected).map((block, index) => ({ ...block, order: index }));
   state.selected = state.current.blocks[0]?.id || null;
+  state.targetError = null;
 });
 function markManual(block) { block.source = "manual"; block.score = null; }
 $("layout-label").onchange = (event) => mutate(() => { const block = selectedBlock(); block.layout_label = event.target.value; markManual(block); });
-$("task").onchange = (event) => mutate(() => { const block = selectedBlock(); block.task = event.target.value || null; markManual(block); });
-$("text").oninput = (event) => mutate(() => { const block = selectedBlock(); block.text = event.target.value; markManual(block); });
+$("task").onchange = (event) => mutate(() => {
+  const block = selectedBlock();
+  block.task = event.target.value || null;
+  state.targetError = null;
+  markManual(block);
+});
+$("text").oninput = (event) => {
+  const block = selectedBlock();
+  if (!block || block.task === null) return;
+  block.text = event.target.value;
+  state.targetError = null;
+  setTargetMessage(inspectTarget(block.task, block.text));
+  markBlockEdited(block);
+};
+$("visual-tab").onclick = () => {
+  state.targetMode = "visual";
+  state.targetError = null;
+  renderTargetEditor();
+};
+$("raw-tab").onclick = () => {
+  state.targetMode = "raw";
+  state.targetError = null;
+  renderTargetEditor();
+  $("text").focus();
+};
+for (const tab of [$("visual-tab"), $("raw-tab")]) {
+  tab.onkeydown = (event) => {
+    if (!["ArrowLeft", "ArrowRight"].includes(event.key)) return;
+    event.preventDefault();
+    const target = tab === $("visual-tab") ? $("raw-tab") : $("visual-tab");
+    target.click();
+    target.focus();
+  };
+}
+$("starter-target").onclick = () => {
+  const block = selectedBlock();
+  if (!block?.task) return;
+  commitVisualModel(block.task, createStarterModel(block.task), { rerender: true });
+};
 $("skipped").onchange = (event) => mutate(() => { const block = selectedBlock(); block.skipped = event.target.checked; markManual(block); });
 $("detect-batch").onclick = () => startBatch("detect");
 $("prelabel-batch").onclick = () => startBatch("prelabel");

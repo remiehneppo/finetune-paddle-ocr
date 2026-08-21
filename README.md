@@ -8,6 +8,11 @@ không sao chép hoặc xử lý lại ảnh. OCR/table/formula/chart dùng chun
 `finetune_vl.py`; trộn nhiều layout trong một run qua cột `task` trong dataset
 để hạn chế phá các khả năng layout khác.
 
+Với nhiều dataset VL thiếu cột `task`, phải khai báo `--dataset-task` theo đúng
+thứ tự source. Table target phải là OTSL, formula là LaTeX, chart là Markdown;
+OCR giữ nguyên newline. Pipeline tính image token theo `smart_resize` thật và
+không truncate ground truth.
+
 Script này fine-tune **text recognition** (ảnh crop chứa một từ/dòng chữ), không phải text detection trên ảnh trang đầy đủ. Nó nhận nhiều Hugging Face dataset đã `save_to_disk()` hoặc snapshot tải từ Hub có `data/*.parquet`, mỗi sample có:
 
 - `image`: `datasets.Image`, PIL image, bytes/path dictionary, hoặc đường dẫn ảnh;
@@ -224,9 +229,10 @@ Vì đây là công cụ local không có cơ chế đăng nhập, `--host` ch�
 
 `run_vl_layout_labeler.py` là service riêng cho pipeline train-oriented:
 `PP-DocLayoutV3` local phát hiện layout, người dùng kiểm tra/sửa bbox và task,
-`llama-server` prelabel text theo crop, rồi export Hugging Face dataset có ba
-cột `image`, `text`, `task`. Tool không sửa ảnh nguồn và không dùng sidecar của
-hai labeler phía trên.
+`llama-server` prelabel text theo crop, rồi export Hugging Face `DatasetDict`
+`train`/`validation` có `image`, `text`, `task`, `source_page_id`. Tool split
+theo trang trước khi tạo crop để không rò cùng một page qua hai split, không
+sửa ảnh nguồn và không dùng sidecar của hai labeler phía trên.
 
 ```bash
 source .venv/bin/activate
@@ -249,10 +255,14 @@ VL không sẵn sàng, chỉ dùng một GPU queue và chỉ bind loopback. Side
 
 Quy trình: `Detect ảnh` hoặc `Detect folder` → chọn block → `Prelabel chọn`/
 `Prelabel ảnh` → sửa layout label/task/text/bbox → `Complete`. `Export HF` chỉ
-lấy block completed, không skip, có task VL và text không rỗng. `Export Layout`
-tạo COCO instance segmentation từ toàn trang; `Export All` tạo nguyên tử hai
-nhánh `<output>/vl/` và `<output>/layout/`. Mỗi export cần tối thiểu hai sample
-hoặc hai trang hợp lệ để tạo train/validation.
+lấy block completed, không skip, có task VL và target đúng schema chính thức.
+Output prelabel mở mặc định bằng editor trực quan: OCR theo dòng, table bằng
+bảng HTML có merge/split ô, formula bằng LaTeX/preview và chart bằng bảng Markdown. Tab `Raw`
+luôn cho phép sửa trực tiếp; raw lỗi không bị ghi đè, còn `Complete` bị chặn cho
+đến khi raw và editor ánh xạ được sang cùng một target hợp lệ.
+`Export Layout` tạo COCO instance segmentation từ toàn trang; `Export All` tạo nguyên tử hai
+nhánh `<output>/vl/` và `<output>/layout/`. Export VL cần tối thiểu hai trang
+hợp lệ để tạo train/validation không leakage.
 
 ```bash
 python finetune_vl.py --prepare-only \

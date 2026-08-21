@@ -9,12 +9,17 @@ import inspect
 import json
 import os
 import time
+import unicodedata
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any, Callable
 
 from finetune_vl import compute_ocr_metrics
-from paddleocr_vl_tasks import TASK_PROMPTS, task_for_prompt
+from paddleocr_vl_tasks import (
+    TASK_PROMPTS,
+    task_for_prompt,
+    validate_target_for_task,
+)
 
 PROMPT = TASK_PROMPTS["ocr"]
 CANDIDATES = ("base", "merged")
@@ -52,7 +57,50 @@ def decode_new_tokens(processor, generated_ids, prompt_token_count: int) -> str:
         skip_special_tokens=True,
         clean_up_tokenization_spaces=False,
     )
-    return decoded[0].strip()
+    return unicodedata.normalize("NFC", decoded[0]).replace("\r\n", "\n").replace(
+        "\r", "\n"
+    )
+
+
+def generated_token_status(
+    generated_ids: Any,
+    prompt_token_count: int,
+    max_new_tokens: int,
+    eos_token_ids: Sequence[int],
+) -> dict[str, Any]:
+    new_token_ids = generated_ids[:, prompt_token_count:]
+    values = new_token_ids.tolist()[0]
+    eos_ids = set(eos_token_ids)
+    ended_with_eos = bool(values and eos_ids and values[-1] in eos_ids)
+    truncated = len(values) >= max_new_tokens and not ended_with_eos
+    finish_reason = "length" if truncated else "eos" if ended_with_eos else "stop"
+    return {
+        "generated_tokens": len(values),
+        "ended_with_eos": ended_with_eos,
+        "truncated": truncated,
+        "finish_reason": finish_reason,
+    }
+
+
+def candidate_eos_token_ids(model: Any, processor: Any) -> tuple[int, ...]:
+    values: list[int] = []
+    owners = (
+        getattr(model, "generation_config", None),
+        getattr(processor, "tokenizer", None),
+    )
+    for owner in owners:
+        value = getattr(owner, "eos_token_id", None)
+        if isinstance(value, int):
+            values.append(value)
+        elif isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
+            values.extend(item for item in value if isinstance(item, int))
+    return tuple(dict.fromkeys(values))
+
+
+def parse_task_token_limits(values: Sequence[str]) -> dict[str, int]:
+    from finetune_vl import parse_task_token_limits as parse_limits
+
+    return parse_limits(values)
 
 
 def validate_candidate_coverage(
@@ -98,7 +146,16 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--validation-jsonl", type=Path, nargs="+", required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--samples-per-dataset", type=int, default=32)
-    parser.add_argument("--max-new-tokens", type=int, default=256)
+    parser.add_argument("--max-new-tokens", type=int, default=1024)
+    parser.add_argument("--task-max-new-tokens", action="append", default=[])
+    parser.add_argument("--min-normalized-edit-distance", type=float, default=0.5)
+    parser.add_argument("--max-cer", type=float, default=1.0)
+    parser.add_argument("--base-predictions-jsonl", type=Path)
+    parser.add_argument(
+        "--report-only",
+        action="store_true",
+        help="Write failed quality-gate reports without returning a non-zero status.",
+    )
     return parser.parse_args(argv)
 
 
@@ -130,7 +187,7 @@ def load_validation_rows(
                 ):
                     raise ValueError(f"Invalid task prompt {path}:{line_number}")
                 try:
-                    task_for_prompt(prompt_row["text"])
+                    task = task_for_prompt(prompt_row["text"])
                 except ValueError as exc:
                     raise ValueError(f"Invalid task prompt {path}:{line_number}") from exc
                 if (
@@ -139,6 +196,12 @@ def load_validation_rows(
                     or not isinstance(target.get("text"), str)
                 ):
                     raise ValueError(f"Invalid OCR target {path}:{line_number}")
+                try:
+                    validate_target_for_task(target["text"], task)
+                except ValueError as exc:
+                    raise ValueError(
+                        f"Invalid {task} target {path}:{line_number}: {exc}"
+                    ) from exc
                 if image.get("matched_text_index") != 0:
                     raise ValueError(f"Invalid OCR image match {path}:{line_number}")
                 image_path = Path(image["image_url"])
@@ -154,6 +217,7 @@ def load_validation_rows(
                         "image": str(image_path.resolve()),
                         "target": target["text"],
                         "prompt": prompt_row["text"],
+                        "task": task,
                     }
                 )
                 selected += 1
@@ -162,6 +226,35 @@ def load_validation_rows(
     if not rows:
         raise ValueError("No validation rows were loaded")
     return rows
+
+
+def load_base_predictions(
+    path: Path, rows: Sequence[Mapping[str, str]]
+) -> list[dict[str, Any]]:
+    expected = {(row["dataset"], row["image"]): row for row in rows}
+    predictions: list[dict[str, Any]] = []
+    with path.open(encoding="utf-8") as handle:
+        for line_number, line in enumerate(handle, 1):
+            if not line.strip():
+                continue
+            payload = json.loads(line)
+            if not isinstance(payload, dict) or payload.get("candidate") != "base":
+                continue
+            fixture = (payload.get("dataset"), payload.get("image"))
+            row = expected.get(fixture)
+            if row is None:
+                raise ValueError(
+                    f"Base predictions contain an unexpected fixture at {path}:{line_number}"
+                )
+            if payload.get("target") != row["target"] or payload.get("task") != row["task"]:
+                raise ValueError(
+                    f"Base prediction contract changed at {path}:{line_number}"
+                )
+            if not isinstance(payload.get("prediction"), str):
+                raise ValueError(f"Invalid base prediction at {path}:{line_number}")
+            predictions.append(payload)
+    validate_candidate_coverage(predictions, ("base",), len(rows))
+    return predictions
 
 
 def _load_rgb_image(image_path: str):
@@ -249,7 +342,9 @@ def evaluate(
     image_loader: Callable[[str], Any] | None = None,
 ) -> dict[str, Any]:
     rows = load_validation_rows(args.validation_jsonl, args.samples_per_dataset)
-    generation_kwargs = deterministic_generation_kwargs(args.max_new_tokens)
+    task_token_limits = parse_task_token_limits(
+        getattr(args, "task_max_new_tokens", [])
+    )
     if (
         torch_module is None
         or auto_processor_class is None
@@ -264,14 +359,23 @@ def evaluate(
         "base": args.base_model.expanduser().resolve(),
         "merged": args.merged_model.expanduser().resolve(),
     }
-    for candidate, model_path in model_paths.items():
+    base_predictions_path = getattr(args, "base_predictions_jsonl", None)
+    candidates_to_evaluate = ("merged",) if base_predictions_path else CANDIDATES
+    for candidate in candidates_to_evaluate:
+        model_path = model_paths[candidate]
         if not model_path.is_dir():
             raise FileNotFoundError(f"{candidate} model directory not found: {model_path}")
 
-    predictions: list[dict[str, Any]] = []
+    predictions = (
+        load_base_predictions(base_predictions_path.expanduser().resolve(), rows)
+        if base_predictions_path
+        else []
+    )
     reports: dict[str, Any] = {}
+    if predictions:
+        reports["base"] = compute_ocr_metrics(predictions)
 
-    for candidate in CANDIDATES:
+    for candidate in candidates_to_evaluate:
         model_path = model_paths[candidate]
         processor = auto_processor_class.from_pretrained(
             str(model_path), trust_remote_code=True, use_fast=False
@@ -285,17 +389,28 @@ def evaluate(
         ).to("cuda").eval()
         try:
             candidate_rows: list[dict[str, Any]] = []
+            eos_token_ids = candidate_eos_token_ids(model, processor)
             for row in rows:
+                max_new_tokens = task_token_limits.get(
+                    row["task"], args.max_new_tokens
+                )
+                generation_kwargs = deterministic_generation_kwargs(max_new_tokens)
                 rendered = processor.apply_chat_template(
                     ocr_messages(row["image"], row["prompt"]),
                     tokenize=False,
                     add_generation_prompt=True,
                 )
-                inputs = processor(
-                    text=[rendered],
-                    images=[image_loader(row["image"])],
-                    return_tensors="pt",
-                )
+                loaded_image = image_loader(row["image"])
+                try:
+                    inputs = processor(
+                        text=[rendered],
+                        images=[loaded_image],
+                        return_tensors="pt",
+                    )
+                finally:
+                    close_image = getattr(loaded_image, "close", None)
+                    if close_image is not None:
+                        close_image()
                 model_inputs = _move_inputs_to_cuda(inputs)
                 prompt_token_count = int(model_inputs["input_ids"].shape[-1])
                 _synchronize_cuda(torch_module)
@@ -309,13 +424,22 @@ def evaluate(
                 prediction = decode_new_tokens(
                     processor, generated_ids, prompt_token_count
                 )
+                token_status = generated_token_status(
+                    generated_ids,
+                    prompt_token_count,
+                    max_new_tokens,
+                    eos_token_ids,
+                )
                 record = {
                     "candidate": candidate,
                     "dataset": row["dataset"],
                     "image": row["image"],
                     "target": row["target"],
+                    "task": row["task"],
                     "prediction": prediction,
                     "runtime_seconds": time.perf_counter() - started,
+                    "max_new_tokens": max_new_tokens,
+                    **token_status,
                 }
                 predictions.append(record)
                 candidate_rows.append(record)
@@ -326,16 +450,41 @@ def evaluate(
             torch_module.cuda.empty_cache()
 
     validate_candidate_coverage(predictions, CANDIDATES, len(rows))
+    failures = quality_gate_failures(
+        reports,
+        predictions,
+        min_normalized_edit_distance=getattr(
+            args, "min_normalized_edit_distance", 0.5
+        ),
+        max_cer=getattr(args, "max_cer", 1.0),
+    )
     report = {
-        "status": "passed",
+        "status": "failed" if failures else "passed",
+        "failures": failures,
         "tasks": sorted({task_for_prompt(row["prompt"]) for row in rows}),
         "prompts": sorted({row["prompt"] for row in rows}),
         "fixture_count": len(rows),
         "samples_per_dataset": args.samples_per_dataset,
         "max_new_tokens": args.max_new_tokens,
+        "task_max_new_tokens": task_token_limits,
+        "base_predictions_jsonl": (
+            str(base_predictions_path.expanduser().resolve())
+            if base_predictions_path
+            else None
+        ),
+        "quality_gate": {
+            "min_normalized_edit_distance": getattr(
+                args, "min_normalized_edit_distance", 0.5
+            ),
+            "max_cer": getattr(args, "max_cer", 1.0),
+            "no_regression_vs_base": True,
+            "require_no_truncation": True,
+        },
         "decoding": {
             "deterministic": True,
-            **generation_kwargs,
+            "do_sample": False,
+            "num_beams": 1,
+            "use_cache": True,
         },
         "candidates": reports,
     }
@@ -352,8 +501,95 @@ def evaluate(
     return report
 
 
+def quality_gate_failures(
+    reports: Mapping[str, Any],
+    predictions: Sequence[Mapping[str, Any]],
+    *,
+    min_normalized_edit_distance: float,
+    max_cer: float,
+) -> list[dict[str, Any]]:
+    failures: list[dict[str, Any]] = []
+    truncated = [
+        row
+        for row in predictions
+        if row.get("truncated")
+    ]
+    for row in truncated:
+        failures.append(
+            {
+                "type": "truncated_generation",
+                "candidate": row["candidate"],
+                "dataset": row["dataset"],
+                "task": row.get("task"),
+                "image": row["image"],
+                "generated_tokens": row.get("generated_tokens"),
+                "max_new_tokens": row.get("max_new_tokens"),
+            }
+        )
+
+    base = reports["base"]
+    merged = reports["merged"]
+    groups = [("overall", "overall")]
+    groups.extend(("task", task) for task in sorted(merged.get("tasks", {})))
+    for group_type, name in groups:
+        merged_metrics = (
+            merged["overall"] if group_type == "overall" else merged["tasks"][name]
+        )
+        base_metrics = (
+            base["overall"]
+            if group_type == "overall"
+            else base.get("tasks", {}).get(name)
+        )
+        scope = name if group_type == "task" else "overall"
+        if merged_metrics["normalized_edit_distance"] < min_normalized_edit_distance:
+            failures.append(
+                {
+                    "type": "normalized_edit_distance_below_minimum",
+                    "scope": scope,
+                    "actual": merged_metrics["normalized_edit_distance"],
+                    "minimum": min_normalized_edit_distance,
+                }
+            )
+        if merged_metrics["cer"] > max_cer:
+            failures.append(
+                {
+                    "type": "cer_above_maximum",
+                    "scope": scope,
+                    "actual": merged_metrics["cer"],
+                    "maximum": max_cer,
+                }
+            )
+        if base_metrics is None:
+            continue
+        regressions = (
+            ("cer", merged_metrics["cer"] > base_metrics["cer"]),
+            (
+                "exact_match",
+                merged_metrics["exact_match"] < base_metrics["exact_match"],
+            ),
+            (
+                "normalized_edit_distance",
+                merged_metrics["normalized_edit_distance"]
+                < base_metrics["normalized_edit_distance"],
+            ),
+        )
+        for metric, regressed in regressions:
+            if regressed:
+                failures.append(
+                    {
+                        "type": "regression_vs_base",
+                        "scope": scope,
+                        "metric": metric,
+                        "base": base_metrics[metric],
+                        "merged": merged_metrics[metric],
+                    }
+                )
+    return failures
+
+
 def main(argv: Sequence[str] | None = None) -> int:
-    report = evaluate(parse_args(argv))
+    args = parse_args(argv)
+    report = evaluate(args)
     print(
         "PADDLEOCR_VL_EVALUATION="
         + json.dumps(
@@ -366,7 +602,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         ),
         flush=True,
     )
-    return 0
+    return 0 if report["status"] == "passed" or args.report_only else 1
 
 
 if __name__ == "__main__":

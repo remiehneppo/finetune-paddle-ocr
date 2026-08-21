@@ -131,6 +131,20 @@ class VLLayoutLabelerTests(unittest.TestCase):
                 status="completed",
                 blocks=[layout_only.model_copy(update={"polygon": [(1, 1)] * 4})],
             )
+        with self.assertRaisesRegex(ValidationError, "OTSL|HTML"):
+            Annotation(
+                image=image_info(),
+                status="completed",
+                blocks=[
+                    layout_only.model_copy(
+                        update={
+                            "layout_label": "table",
+                            "task": "table",
+                            "text": "<table><tr><td>A</td></tr></table>",
+                        }
+                    )
+                ],
+            )
 
     def test_polygon_helpers_clamp_bbox_and_area(self):
         polygon = clamp_polygon([(-2, -1), (21, -1), (21, 8), (-2, 8)], 20, 10)
@@ -197,40 +211,99 @@ class VLLayoutLabelerTests(unittest.TestCase):
     def test_export_has_hf_schema_and_only_completed_blocks(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            Image.new("RGB", (20, 10), "white").save(root / "page.png")
-            Image.new("RGB", (20, 10), "white").save(root / "pending.png")
+            Image.new("RGB", (20, 10), "white").save(root / "page1.png")
+            Image.new("RGB", (20, 10), "gray").save(root / "page2.png")
             catalog = WorkspaceCatalog.open(root)
-            record = next(item for item in catalog.list_images() if item.name == "page.png")
             store = AnnotationStore(root)
-            draft = store.load(record)
-            block = Block(order=0, polygon=[(1, 1), (8, 1), (8, 8), (1, 8)], layout_label="text", task="ocr", text="hello")
-            second = Block(order=1, polygon=[(9, 1), (15, 1), (15, 8), (9, 8)], layout_label="table", task="table", text="<table></table>")
-            layout_only = Block(order=2, polygon=[(15, 1), (19, 1), (19, 8), (15, 8)], layout_label="image", task=None, text="ignored")
-            skipped = Block(order=3, polygon=[(11, 1), (19, 1), (19, 8), (11, 8)], layout_label="table", task="table", text="ignored", skipped=True)
-            saved = store.save(record, draft.model_copy(update={"blocks": [block, second, layout_only, skipped], "status": "edited"}))
-            complete = Annotation.model_validate({**saved.model_dump(mode="python"), "status": "completed"})
-            store.save(record, complete)
-            pending = next(item for item in catalog.list_images() if item.name == "pending.png")
-            pending_draft = store.load(pending)
-            store.save(
-                pending,
-                pending_draft.model_copy(
-                    update={
-                        "blocks": [block.model_copy(update={"id": uuid4()})],
-                        "status": "edited",
-                    }
-                ),
+            tasks = (
+                ("page1.png", "text", "ocr", "hello"),
+                ("page2.png", "table", "table", "<fcel>A<nl>"),
             )
+            for name, layout_label, task, text in tasks:
+                record = next(
+                    item for item in catalog.list_images() if item.name == name
+                )
+                draft = store.load(record)
+                block = Block(
+                    order=0,
+                    polygon=[(1, 1), (8, 1), (8, 8), (1, 8)],
+                    layout_label=layout_label,
+                    task=task,
+                    text=text,
+                )
+                layout_only = Block(
+                    order=1,
+                    polygon=[(9, 1), (15, 1), (15, 8), (9, 8)],
+                    layout_label="image",
+                    task=None,
+                    text="ignored",
+                )
+                saved = store.save(
+                    record,
+                    draft.model_copy(
+                        update={"blocks": [block, layout_only], "status": "edited"}
+                    ),
+                )
+                store.save(
+                    record,
+                    Annotation.model_validate(
+                        {**saved.model_dump(mode="python"), "status": "completed"}
+                    ),
+                )
             result = store.export_hf(catalog, root / "export")
             self.assertEqual(result["samples"], 2)
+            self.assertEqual(result["train_pages"], 1)
+            self.assertEqual(result["validation_pages"], 1)
             from datasets import load_from_disk
 
             dataset = load_from_disk(root / "export")
-            self.assertEqual(dataset.column_names, ["image", "text", "task"])
-            self.assertEqual(dataset[0]["text"], "hello")
-            self.assertEqual(dataset[0]["task"], "ocr")
-            self.assertEqual(dataset[1]["task"], "table")
+            self.assertEqual(set(dataset), {"train", "validation"})
+            page_ids = {
+                split: set(dataset[split]["source_page_id"]) for split in dataset
+            }
+            self.assertFalse(page_ids["train"].intersection(page_ids["validation"]))
+            rows = [dataset[split][0] for split in ("train", "validation")]
+            self.assertEqual({row["task"] for row in rows}, {"ocr", "table"})
+            self.assertEqual(
+                dataset["train"].column_names,
+                ["image", "text", "task", "source_page_id"],
+            )
             self.assertTrue(list((root / "export" / "crops").glob("*.png")))
+
+    def test_hf_export_rejects_html_table_targets(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for name in ("page1.png", "page2.png"):
+                Image.new("RGB", (20, 10), "white").save(root / name)
+            catalog = WorkspaceCatalog.open(root)
+            store = AnnotationStore(root)
+            records = catalog.list_images()
+            draft = store.load(records[0])
+            invalid_legacy = draft.model_copy(
+                update={
+                    "status": "completed",
+                    "blocks": [
+                        Block(
+                            order=0,
+                            polygon=[(1, 1), (8, 1), (8, 8), (1, 8)],
+                            layout_label="table",
+                            task="table",
+                            text="<table><tr><td>A</td></tr></table>",
+                        )
+                    ],
+                }
+            )
+            with (
+                patch.object(
+                    store,
+                    "_load_saved",
+                    side_effect=lambda record: invalid_legacy
+                    if record.image_id == records[0].image_id
+                    else None,
+                ),
+                self.assertRaisesRegex(ExportError, "OTSL|HTML"),
+            ):
+                store.export_hf(catalog, root / "export")
 
     def test_layout_export_has_coco_taxonomy_read_order_and_immutable_images(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -426,9 +499,25 @@ class VLLayoutLabelerTests(unittest.TestCase):
     def test_static_ui_exposes_layout_and_atomic_exports(self):
         html = Path("vl_layout_labeler/static/index.html").read_text(encoding="utf-8")
         script = Path("vl_layout_labeler/static/app.mjs").read_text(encoding="utf-8")
-        for element_id in ("layout-label", "export-hf", "export-layout", "export-all"):
+        for element_id in (
+            "layout-label",
+            "target-editor",
+            "visual-tab",
+            "raw-tab",
+            "visual-editor",
+            "text",
+            "export-hf",
+            "export-layout",
+            "export-all",
+        ):
             self.assertIn(f'id="{element_id}"', html)
         self.assertIn("Không xuất VL", html)
+        self.assertIn('from "./target_codec.mjs"', script)
+        self.assertIn("inspectTarget(block.task, block.text)", script)
+        self.assertIn("holder.rowSpan = cell.rowspan", script)
+        self.assertIn("holder.colSpan = cell.colspan", script)
+        self.assertIn('targetButton("Gộp →"', script)
+        self.assertIn('targetButton("Tách"', script)
         self.assertIn('block.task || "layout-only"', script)
         self.assertIn('exportDataset("/api/export/all"', script)
 

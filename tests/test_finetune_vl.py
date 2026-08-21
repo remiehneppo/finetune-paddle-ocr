@@ -344,7 +344,7 @@ class FinetuneVLTests(unittest.TestCase):
             processor, np.array([[10, 11, 20, 21]]), 2
         )
 
-        self.assertEqual(decoded, "xin chào")
+        self.assertEqual(decoded, "  xin chào  ")
         self.assertEqual(processor.token_ids, [[20, 21]])
         self.assertTrue(processor.kwargs["skip_special_tokens"])
 
@@ -366,6 +366,26 @@ class FinetuneVLTests(unittest.TestCase):
             evaluate_paddleocr_vl.validate_candidate_coverage(
                 [*predictions, predictions[-1]], ("base", "merged"), 2
             )
+
+    def test_evaluator_reuses_only_matching_base_predictions(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "predictions.jsonl"
+            row = {
+                "dataset": "a",
+                "image": "/tmp/one.png",
+                "target": "xin chào",
+                "task": "ocr",
+            }
+            base = {**row, "candidate": "base", "prediction": "xin chào"}
+            merged = {**row, "candidate": "merged", "prediction": "khác"}
+            path.write_text(
+                "\n".join(json.dumps(item) for item in (base, merged)) + "\n",
+                encoding="utf-8",
+            )
+
+            loaded = evaluate_paddleocr_vl.load_base_predictions(path, [row])
+
+        self.assertEqual(loaded, [base])
 
     def test_evaluator_aliases_remote_inputs_embeds_mask_keyword(self):
         calls = []
@@ -424,6 +444,7 @@ class FinetuneVLTests(unittest.TestCase):
                     "image": str(image.resolve()),
                     "target": "một",
                     "prompt": "OCR:",
+                    "task": "ocr",
                 }
             ],
         )
@@ -603,13 +624,45 @@ class FinetuneVLTests(unittest.TestCase):
                 finetune_vl.require_local_model_snapshot(str(model)), model.resolve()
             )
 
+    def test_work_and_merge_outputs_cannot_live_inside_base_model(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            model = root / "model"
+            adapter = root / "adapter"
+            model.mkdir()
+            adapter.mkdir()
+            (model / "config.json").write_text(
+                json.dumps({"model_type": "paddleocr_vl"})
+            )
+            (adapter / "lora_config.json").write_text("{}")
+            with self.assertRaisesRegex(ValueError, "immutable base model"):
+                finetune_vl.validate_work_dir_isolation(model / "run", model)
+            with self.assertRaisesRegex(ValueError, "immutable base model"):
+                merge_paddleocr_vl_lora.validate_inputs(
+                    model, adapter, model / "export"
+                )
+
     def test_visual_token_reserve_is_included_in_sequence_budget(self):
-        self.assertEqual(finetune_vl.visual_token_reserve(451_584), 578)
         self.assertEqual(
             finetune_vl.total_multimodal_tokens(
                 CharacterTokenizer(), "abc", visual_tokens=10
             ),
-            len("OCR:abc") + 2 + 10,
+            len("OCR:abc") + 1 + 10,
+        )
+        self.assertEqual(
+            finetune_vl.smart_resize_dimensions(
+                100, 200, min_pixels=50_176, max_pixels=451_584
+            ),
+            (168, 336),
+        )
+        self.assertEqual(
+            finetune_vl.visual_token_count(
+                100,
+                200,
+                min_pixels=50_176,
+                max_pixels=451_584,
+            ),
+            72,
         )
 
     def test_process_split_decodes_rgb_and_rejects_bad_rows(self):
@@ -632,7 +685,7 @@ class FinetuneVLTests(unittest.TestCase):
                     split_name="train",
                     prepared_dir=root / "prepared",
                     max_image_pixels=1_000,
-                    max_seq_len=25,
+                    max_seq_len=100,
                     tokenizer=CharacterTokenizer(),
                     report=report,
                 )
@@ -705,8 +758,10 @@ class FinetuneVLTests(unittest.TestCase):
                 validation_ratio=0.2,
                 seed=7,
                 max_image_pixels=10_000,
-                max_pixels=784,
+                min_pixels=1568,
+                max_pixels=1568,
                 max_seq_len=100,
+                dataset_task=["ocr", "ocr"],
             )
             with patch.object(
                 finetune_vl,
@@ -1241,6 +1296,191 @@ class FinetuneVLTests(unittest.TestCase):
         self.assertAlmostEqual(report["overall"]["cer"], 1 / 7)
         self.assertAlmostEqual(report["overall"]["normalized_edit_distance"], 0.875)
         self.assertEqual(report["datasets"]["a"]["exact_match"], 1.0)
+
+    def test_metrics_and_quality_gate_are_task_aware_and_fail_regression(self):
+        base_rows = [
+            {
+                "dataset": "a",
+                "task": "ocr",
+                "target": "abc",
+                "prediction": "abc",
+            }
+        ]
+        merged_rows = [dict(base_rows[0], prediction="axc")]
+        reports = {
+            "base": finetune_vl.compute_ocr_metrics(base_rows),
+            "merged": finetune_vl.compute_ocr_metrics(merged_rows),
+        }
+        failures = evaluate_paddleocr_vl.quality_gate_failures(
+            reports,
+            [],
+            min_normalized_edit_distance=0.5,
+            max_cer=1.0,
+        )
+        self.assertIn("ocr", reports["merged"]["tasks"])
+        self.assertTrue(
+            any(failure["type"] == "regression_vs_base" for failure in failures)
+        )
+
+    def test_generation_status_marks_limit_without_eos_as_truncated(self):
+        generated = np.array([[10, 11, 20, 21]])
+        status = evaluate_paddleocr_vl.generated_token_status(
+            generated, 2, 2, (99,)
+        )
+        self.assertTrue(status["truncated"])
+        self.assertEqual(status["finish_reason"], "length")
+        ended = evaluate_paddleocr_vl.generated_token_status(
+            np.array([[10, 11, 20, 99]]), 2, 2, (99,)
+        )
+        self.assertFalse(ended["truncated"])
+        self.assertEqual(ended["finish_reason"], "eos")
+
+    def test_adapter_candidates_include_final_and_latest_checkpoints(self):
+        with tempfile.TemporaryDirectory() as directory:
+            work_dir = Path(directory)
+            adapter = work_dir / "adapter"
+            adapter.mkdir()
+            (adapter / "lora_config.json").write_text("{}")
+            for step in (10, 30, 20):
+                checkpoint = adapter / f"checkpoint-{step}"
+                checkpoint.mkdir()
+                (checkpoint / "lora_config.json").write_text("{}")
+            candidates = finetune_vl.adapter_candidates(work_dir, 2)
+        self.assertEqual(
+            [candidate.name for candidate in candidates],
+            ["adapter", "checkpoint-30", "checkpoint-20"],
+        )
+
+    def test_candidate_evaluation_selects_best_checkpoint_and_cleans_exports(self):
+        with tempfile.TemporaryDirectory() as directory:
+            work_dir = Path(directory)
+            adapter = work_dir / "adapter"
+            adapter.mkdir()
+            (adapter / "lora_config.json").write_text("{}")
+            checkpoint = adapter / "checkpoint-20"
+            checkpoint.mkdir()
+            (checkpoint / "lora_config.json").write_text("{}")
+            model = work_dir / "model"
+            model.mkdir()
+            validation = work_dir / "validation.jsonl"
+            validation.write_text("{}\n")
+            metrics = {
+                "adapter": (0.2, 0.5, 0.8),
+                "checkpoint-20": (0.1, 0.7, 0.9),
+            }
+            evaluation_commands = []
+
+            def fake_run(command, *_args, **_kwargs):
+                output_dir = Path(command[command.index("--output-dir") + 1])
+                output_dir.mkdir(parents=True, exist_ok=True)
+                if str(command[1]).endswith("evaluate_paddleocr_vl.py"):
+                    evaluation_commands.append(command)
+                    candidate = Path(
+                        command[command.index("--merged-model") + 1]
+                    ).name
+                    cer, exact_match, normalized = metrics[candidate]
+                    report = {
+                        "status": "passed",
+                        "failures": [],
+                        "candidates": {
+                            "merged": {
+                                "overall": {
+                                    "samples": 1,
+                                    "cer": cer,
+                                    "exact_match": exact_match,
+                                    "normalized_edit_distance": normalized,
+                                }
+                            }
+                        },
+                    }
+                    (output_dir / "ocr_metrics.json").write_text(
+                        json.dumps(report), encoding="utf-8"
+                    )
+                    (output_dir / "ocr_predictions.jsonl").write_text(
+                        "{}\n", encoding="utf-8"
+                    )
+                return "", None
+
+            args = argparse.Namespace(
+                eval_max_checkpoints=1,
+                erniekit_dir=work_dir,
+                min_pixels=50_176,
+                max_pixels=451_584,
+                devices="0",
+                eval_max_new_tokens=1024,
+                eval_task_max_new_tokens=[],
+                min_normalized_edit_distance=0.5,
+                max_cer=1.0,
+                smoke_steps=None,
+            )
+            with (
+                patch.object(finetune_vl, "validate_adapter_scope"),
+                patch.object(finetune_vl, "validate_adapter_base_model"),
+                patch.object(finetune_vl, "run_logged_command", side_effect=fake_run),
+            ):
+                selected, report = finetune_vl.evaluate_adapter_candidates(
+                    args,
+                    work_dir,
+                    model,
+                    [validation],
+                    validation,
+                    1,
+                )
+
+            self.assertEqual(selected, checkpoint.resolve())
+            self.assertEqual(report["selected"]["checkpoint"], "checkpoint-20")
+            self.assertNotIn("--base-predictions-jsonl", evaluation_commands[0])
+            self.assertIn("--base-predictions-jsonl", evaluation_commands[1])
+            self.assertIn("--report-only", evaluation_commands[0])
+            self.assertIn("--report-only", evaluation_commands[1])
+            self.assertFalse((work_dir / ".checkpoint-evaluation").exists())
+
+    def test_failed_evaluation_exits_nonzero_unless_report_only(self):
+        failed = {"status": "failed", "fixture_count": 1, "candidates": {}}
+        with (
+            patch.object(evaluate_paddleocr_vl, "parse_args") as parse_args,
+            patch.object(evaluate_paddleocr_vl, "evaluate", return_value=failed),
+        ):
+            parse_args.return_value = argparse.Namespace(report_only=False)
+            self.assertEqual(evaluate_paddleocr_vl.main([]), 1)
+            parse_args.return_value = argparse.Namespace(report_only=True)
+            self.assertEqual(evaluate_paddleocr_vl.main([]), 0)
+
+    def test_export_promotion_restores_previous_directory_on_failure(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            candidate = root / "candidate"
+            destination = root / "export"
+            candidate.mkdir()
+            destination.mkdir()
+            (candidate / "model.safetensors").write_text("new")
+            (destination / "model.safetensors").write_text("old")
+            real_replace = os.replace
+            calls = 0
+
+            def fail_candidate_promotion(source, target):
+                nonlocal calls
+                calls += 1
+                if calls == 2:
+                    raise OSError("promotion failed")
+                return real_replace(source, target)
+
+            with (
+                patch.object(finetune_vl.os, "replace", side_effect=fail_candidate_promotion),
+                self.assertRaisesRegex(OSError, "promotion failed"),
+            ):
+                finetune_vl.promote_export_directory(candidate, destination)
+
+            self.assertEqual(
+                (destination / "model.safetensors").read_text(), "old"
+            )
+            self.assertTrue(candidate.is_dir())
+
+            finetune_vl.promote_export_directory(candidate, destination)
+            self.assertEqual(
+                (destination / "model.safetensors").read_text(), "new"
+            )
+            self.assertFalse(candidate.exists())
 
     def test_export_status_distinguishes_verified_failed_and_skipped(self):
         self.assertEqual(

@@ -6,6 +6,7 @@ from typing import Any, Literal
 from uuid import UUID, uuid4
 
 from pydantic import BaseModel, Field, field_validator, model_validator
+from paddleocr_vl_tasks import validate_target_for_task
 
 Point = tuple[float, float]
 LayoutSource = Literal["layout", "vl", "manual"]
@@ -109,6 +110,13 @@ class Annotation(BaseModel):
                     raise ValueError("completed annotations require positive-area polygons")
                 if block.task is not None and not block.text.strip():
                     raise ValueError("completed VL blocks require text")
+                if block.task is not None:
+                    try:
+                        validate_target_for_task(block.text, block.task)
+                    except ValueError as exc:
+                        raise ValueError(
+                            f"completed {block.task} block has invalid target: {exc}"
+                        ) from exc
         return self
 
 

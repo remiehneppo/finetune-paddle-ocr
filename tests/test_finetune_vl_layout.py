@@ -1,3 +1,4 @@
+import argparse
 import json
 import tempfile
 import unittest
@@ -44,13 +45,19 @@ def create_prepared_run(root: Path, tasks: list[str], *, legacy: bool = False) -
     images = prepared / "images" / "source-000"
     images.mkdir(parents=True)
     samples = []
+    targets = {
+        "ocr": "target-ocr",
+        "table": "<fcel>target<table><nl>".replace("<table>", "-table"),
+        "formula": r"\[x^2\]",
+        "chart": "| A | B |\n|---|---|\n| 1 | 2 |",
+    }
     for index, task in enumerate(tasks):
         name = f"train-{index}.png"
         (images / name).write_bytes(png_bytes())
         samples.append(
             finetune_vl.PreparedSample(
                 f"images/source-000/{name}",
-                f"target-{task}",
+                targets[task],
                 0,
                 TASK_PROMPTS[task],
             )
@@ -64,7 +71,7 @@ def create_prepared_run(root: Path, tasks: list[str], *, legacy: bool = False) -
         [
             finetune_vl.PreparedSample(
                 "images/source-000/validation.png",
-                "validation",
+                targets[tasks[0]],
                 0,
                 TASK_PROMPTS[tasks[0]],
             )
@@ -137,8 +144,52 @@ class FinetuneVLLayoutTests(unittest.TestCase):
                 finetune_vl.total_multimodal_tokens(
                     tokenizer, "abc", visual_tokens=10, prompt=prompt
                 ),
-                len(prompt + "abc") + 2 + 10,
+                len(prompt + "abc") + 1 + 10,
             )
+
+    def test_ocr_target_preserves_multiline_layout(self):
+        target = finetune_vl.normalize_target(
+            {"text": "  Dòng một\r\nDòng hai\rDòng ba  "}, "ocr"
+        )
+        self.assertEqual(target, "  Dòng một\nDòng hai\nDòng ba  ")
+
+    def test_multiple_sources_without_task_column_require_dataset_mapping(self):
+        args = argparse.Namespace(dataset_dir=[Path("a"), Path("b")], task="ocr")
+        split = FakeSplit([{"image": {}, "text": "x"}])
+        with self.assertRaisesRegex(ValueError, "dataset-task"):
+            finetune_vl.dataset_default_task(args, 0, split, None)
+        args.dataset_task = ["ocr", "formula"]
+        self.assertEqual(
+            finetune_vl.dataset_default_task(args, 1, split, None), "formula"
+        )
+
+    def test_table_target_requires_otsl_and_rejects_html(self):
+        from paddleocr_vl_tasks import validate_target_for_task
+
+        validate_target_for_task("<fcel>A<nl>", "table")
+        with self.assertRaisesRegex(ValueError, "OTSL|HTML"):
+            validate_target_for_task("<table><tr><td>A</td></tr></table>", "table")
+        with self.assertRaisesRegex(ValueError, "same number"):
+            validate_target_for_task("<fcel>A<nl><fcel>B<ecel><nl>", "table")
+        with self.assertRaisesRegex(ValueError, "left"):
+            validate_target_for_task("<lcel><nl>", "table")
+        with self.assertRaisesRegex(ValueError, "rectangle|overlap|merged"):
+            validate_target_for_task(
+                "<fcel>A<lcel><lcel><nl><ucel><xcel><fcel>B<nl>",
+                "table",
+            )
+
+    def test_chart_target_requires_a_rectangular_markdown_table(self):
+        from paddleocr_vl_tasks import validate_target_for_task
+
+        validate_target_for_task(
+            "| Nhãn | Giá trị |\n| :--- | ---: |\n| A \\| B | 12 |",
+            "chart",
+        )
+        with self.assertRaisesRegex(ValueError, "separator"):
+            validate_target_for_task("| A | B |\n| C | D |\n| 1 | 2 |", "chart")
+        with self.assertRaisesRegex(ValueError, "same number"):
+            validate_target_for_task("| A | B |\n| --- | --- |\n| 1 |", "chart")
 
     def test_prepared_run_accepts_mixed_and_legacy_ocr(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -175,12 +226,17 @@ class FinetuneVLLayoutTests(unittest.TestCase):
                 validation,
                 [
                     finetune_vl.PreparedSample(
-                        "chart.png", "| A | B |", 0, prompt
+                        "chart.png",
+                        "| A | B |\n| --- | --- |\n| 1 | 2 |",
+                        0,
+                        prompt,
                     )
                 ],
             )
             rows = evaluate_paddleocr_vl.load_validation_rows([validation], 1)
-            self.assertEqual(rows[0]["target"], "| A | B |")
+            self.assertEqual(
+                rows[0]["target"], "| A | B |\n| --- | --- |\n| 1 | 2 |"
+            )
             self.assertEqual(rows[0]["prompt"], prompt)
 
             bad = root / "validation-bad.jsonl"
@@ -234,9 +290,9 @@ class FinetuneVLLayoutTests(unittest.TestCase):
                         str(work_dir),
                         "--prepare-only",
                         "--min-pixels",
-                        "784",
+                        "1568",
                         "--max-pixels",
-                        "784",
+                        "1568",
                         "--max-seq-len",
                         "1000",
                         "--validation-ratio",

@@ -14,6 +14,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import threading
 import unicodedata
 from collections import Counter, defaultdict
@@ -28,7 +29,13 @@ import yaml
 from PIL import Image, UnidentifiedImageError
 
 import finetune as rec_loader
-from paddleocr_vl_tasks import TASK_PROMPTS, prompt_for_task, resolve_row_task, task_for_prompt
+from paddleocr_vl_tasks import (
+    TASK_PROMPTS,
+    prompt_for_task,
+    resolve_row_task,
+    task_for_prompt,
+    validate_target_for_task,
+)
 
 LOGGER = logging.getLogger("paddleocr_vl_vi_finetune")
 PROMPT = TASK_PROMPTS["ocr"]
@@ -62,8 +69,6 @@ normalize_text = rec_loader.normalize_text
 
 
 def normalize_target(row: Mapping[str, Any], task: str = "ocr") -> str:
-    if task == "ocr":
-        return normalize_text(row)
     value: str | None = None
     for column in ("label", "text"):
         candidate = row.get(column)
@@ -73,7 +78,8 @@ def normalize_target(row: Mapping[str, Any], task: str = "ocr") -> str:
     if value is None:
         return ""
     value = unicodedata.normalize("NFC", value)
-    return value.replace("\r\n", "\n").replace("\r", "\n").strip()
+    value = value.replace("\r\n", "\n").replace("\r", "\n")
+    return value if value.strip() else ""
 
 
 @dataclass(frozen=True)
@@ -153,6 +159,15 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--dataset-dir", type=Path, nargs="+")
     parser.add_argument(
+        "--dataset-task",
+        choices=tuple(TASK_PROMPTS),
+        nargs="+",
+        help=(
+            "Default task for each --dataset-dir, in the same order. Required "
+            "when multiple sources omit a per-row 'task' column."
+        ),
+    )
+    parser.add_argument(
         "--prepared-from",
         type=Path,
         help="Reuse JSONL and images from an existing --prepare-only run.",
@@ -185,8 +200,17 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--prefetch-factor", type=int, default=2)
     parser.add_argument("--seed", type=int, default=2026)
     parser.add_argument("--eval-samples-per-dataset", type=int, default=32)
-    parser.add_argument("--eval-max-new-tokens", type=int, default=256)
+    parser.add_argument("--eval-max-new-tokens", type=int, default=1024)
+    parser.add_argument(
+        "--eval-task-max-new-tokens",
+        action="append",
+        default=[],
+        metavar="TASK=COUNT",
+        help="Override generation limit per task; may be repeated.",
+    )
     parser.add_argument("--eval-max-checkpoints", type=int, default=3)
+    parser.add_argument("--min-normalized-edit-distance", type=float, default=0.5)
+    parser.add_argument("--max-cer", type=float, default=1.0)
     parser.add_argument("--save-steps", type=int, default=100)
     parser.add_argument("--skip-evaluation", action="store_true")
     parser.add_argument(
@@ -201,6 +225,26 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+def parse_task_token_limits(values: Sequence[str]) -> dict[str, int]:
+    limits: dict[str, int] = {}
+    for value in values:
+        task, separator, raw_count = value.partition("=")
+        if not separator:
+            raise ValueError("task token limits must use TASK=COUNT")
+        task = task.strip()
+        prompt_for_task(task)
+        try:
+            count = int(raw_count)
+        except ValueError as exc:
+            raise ValueError(f"invalid token limit for task {task!r}") from exc
+        if count <= 0:
+            raise ValueError(f"token limit for task {task!r} must be positive")
+        if task in limits:
+            raise ValueError(f"duplicate token limit for task {task!r}")
+        limits[task] = count
+    return limits
+
+
 def validate_args(args: argparse.Namespace) -> None:
     prompt_for_task(args.task)
     has_datasets = bool(args.dataset_dir)
@@ -213,6 +257,10 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--prepared-from cannot be used with --prepare-only")
     if has_prepared and args.resume_from is not None:
         raise ValueError("--prepared-from cannot be used with --resume-from")
+    if args.dataset_task and not has_datasets:
+        raise ValueError("--dataset-task requires --dataset-dir")
+    if args.dataset_task and len(args.dataset_task) != len(args.dataset_dir):
+        raise ValueError("--dataset-task must contain one task per --dataset-dir")
 
     missing = [str(path) for path in (args.dataset_dir or ()) if not path.is_dir()]
     if missing:
@@ -244,6 +292,11 @@ def validate_args(args: argparse.Namespace) -> None:
             raise ValueError(f"--{name.replace('_', '-')} must be positive")
     if args.min_pixels > args.max_pixels:
         raise ValueError("--min-pixels cannot exceed --max-pixels")
+    if not 0.0 <= args.min_normalized_edit_distance <= 1.0:
+        raise ValueError("--min-normalized-edit-distance must be between 0 and 1")
+    if args.max_cer < 0.0:
+        raise ValueError("--max-cer must be non-negative")
+    parse_task_token_limits(args.eval_task_max_new_tokens)
     if args.smoke_steps is not None and args.smoke_steps <= 0:
         raise ValueError("--smoke-steps must be positive")
     selected_devices(args.devices)
@@ -310,21 +363,70 @@ def require_local_model_snapshot(model: str) -> Path:
 
 
 def count_tokens(tokenizer: Any, text: str, prompt: str = PROMPT) -> int:
-    combined = f"{prompt}{text}"
-    if hasattr(tokenizer, "encode"):
-        return len(tokenizer.encode(combined, add_special_tokens=True))
-    encoded = tokenizer(combined, add_special_tokens=True)
-    input_ids = (
-        encoded["input_ids"] if isinstance(encoded, Mapping) else encoded.input_ids
-    )
-    return len(input_ids)
+    def encode(value: str) -> Sequence[int]:
+        if hasattr(tokenizer, "encode"):
+            encoded = tokenizer.encode(value, add_special_tokens=False)
+        else:
+            encoded = tokenizer(value, add_special_tokens=False)
+        if isinstance(encoded, Mapping):
+            return encoded["input_ids"]
+        return encoded.input_ids if hasattr(encoded, "input_ids") else encoded
+
+    return len(encode(prompt)) + len(encode(text)) + 1
 
 
-def visual_token_reserve(
-    max_pixels: int, patch_size: int = 14, merge_size: int = 2
+def smart_resize_dimensions(
+    height: int,
+    width: int,
+    *,
+    min_pixels: int,
+    max_pixels: int,
+    factor: int = 28,
+) -> tuple[int, int]:
+    if height <= 0 or width <= 0:
+        raise ValueError("image dimensions must be positive")
+    if height < factor:
+        width = round(width * factor / height)
+        height = factor
+    if width < factor:
+        height = round(height * factor / width)
+        width = factor
+    if max(height, width) / min(height, width) > 200:
+        raise ValueError("absolute image aspect ratio must be smaller than 200")
+    resized_height = round(height / factor) * factor
+    resized_width = round(width / factor) * factor
+    if resized_height * resized_width > max_pixels:
+        scale = math.sqrt(height * width / max_pixels)
+        resized_height = math.floor(height / scale / factor) * factor
+        resized_width = math.floor(width / scale / factor) * factor
+    elif resized_height * resized_width < min_pixels:
+        scale = math.sqrt(min_pixels / (height * width))
+        resized_height = math.ceil(height * scale / factor) * factor
+        resized_width = math.ceil(width * scale / factor) * factor
+    if resized_height <= 0 or resized_width <= 0:
+        raise ValueError("image becomes empty after PaddleOCR-VL smart resize")
+    return resized_height, resized_width
+
+
+def visual_token_count(
+    height: int,
+    width: int,
+    *,
+    min_pixels: int,
+    max_pixels: int,
+    patch_size: int = 14,
+    merge_size: int = 2,
 ) -> int:
-    token_area = (patch_size * merge_size) ** 2
-    return math.ceil(max_pixels / token_area) + 2
+    resized_height, resized_width = smart_resize_dimensions(
+        height,
+        width,
+        min_pixels=min_pixels,
+        max_pixels=max_pixels,
+        factor=patch_size * merge_size,
+    )
+    grid_height = resized_height // patch_size
+    grid_width = resized_width // patch_size
+    return grid_height * grid_width // (merge_size**2)
 
 
 def total_multimodal_tokens(
@@ -390,7 +492,8 @@ def process_split(
     max_seq_len: int,
     tokenizer: Any,
     report: RejectionReport,
-    visual_tokens: int = 0,
+    min_pixels: int = DEFAULT_MIN_PIXELS,
+    max_pixels: int = DEFAULT_MAX_PIXELS,
     default_task: str = "ocr",
 ) -> list[PreparedSample]:
     columns = set(getattr(split, "column_names", []))
@@ -418,35 +521,54 @@ def process_split(
         if not text:
             report.reject(dataset_dir, split_name, row_index, "empty_text")
             continue
-        if any(
-            unicodedata.category(character) == "Cc"
-            and not (task != "ocr" and character == "\n")
-            for character in text
-        ):
-            report.reject(dataset_dir, split_name, row_index, "control_character")
-            continue
-        token_count = total_multimodal_tokens(
-            tokenizer, text, visual_tokens=visual_tokens, prompt=prompt
-        )
-        if token_count > max_seq_len:
+        try:
+            validate_target_for_task(text, task)
+        except ValueError as exc:
             report.reject(
                 dataset_dir,
                 split_name,
                 row_index,
-                "token_budget_exceeded",
-                f"{token_count} > {max_seq_len}",
+                "invalid_target_schema",
+                str(exc),
             )
             continue
-
+        if any(
+            unicodedata.category(character) == "Cc"
+            and character != "\n"
+            for character in text
+        ):
+            report.reject(dataset_dir, split_name, row_index, "control_character")
+            continue
+        image: Image.Image | None = None
         try:
             image = open_image_rgb(row.get("image"), dataset_dir, max_image_pixels)
+            image_visual_tokens = visual_token_count(
+                image.height,
+                image.width,
+                min_pixels=min_pixels,
+                max_pixels=max_pixels,
+            )
+            token_count = total_multimodal_tokens(
+                tokenizer,
+                text,
+                visual_tokens=image_visual_tokens,
+                prompt=prompt,
+            )
+            if token_count > max_seq_len:
+                report.reject(
+                    dataset_dir,
+                    split_name,
+                    row_index,
+                    "token_budget_exceeded",
+                    f"{token_count} > {max_seq_len}",
+                )
+                continue
             relative_path = (
                 Path("images")
                 / f"source-{dataset_index:03d}"
                 / (f"{split_name}-{row_index:09d}.png")
             )
             _save_png(image, prepared_dir / relative_path)
-            image.close()
         except PixelLimitExceeded as exc:
             report.reject(
                 dataset_dir,
@@ -459,6 +581,9 @@ def process_split(
         except (OSError, ValueError, TypeError, UnidentifiedImageError) as exc:
             report.reject(dataset_dir, split_name, row_index, "invalid_image", str(exc))
             continue
+        finally:
+            if image is not None:
+                image.close()
         samples.append(
             PreparedSample(relative_path.as_posix(), text, dataset_index, prompt)
         )
@@ -469,6 +594,29 @@ def split_train_validation(
     samples: Sequence[PreparedSample], validation_ratio: float, seed: int
 ) -> tuple[list[PreparedSample], list[PreparedSample]]:
     return rec_loader.split_train_validation(samples, validation_ratio, seed)
+
+
+def dataset_default_task(
+    args: argparse.Namespace,
+    dataset_index: int,
+    train_split: Any,
+    validation_split: Any | None,
+) -> str:
+    dataset_tasks = getattr(args, "dataset_task", None)
+    if dataset_tasks:
+        return dataset_tasks[dataset_index]
+    splits = [train_split]
+    if validation_split is not None:
+        splits.append(validation_split)
+    missing_task_column = any(
+        "task" not in set(getattr(split, "column_names", [])) for split in splits
+    )
+    if len(args.dataset_dir) > 1 and missing_task_column:
+        raise ValueError(
+            "Multiple dataset sources without a per-row 'task' column require "
+            "one --dataset-task value per --dataset-dir"
+        )
+    return getattr(args, "task", "ocr")
 
 
 def sqrt_probabilities(sample_counts: Sequence[int]) -> list[float]:
@@ -501,7 +649,6 @@ def write_erniekit_jsonl(path: Path, samples: Iterable[PreparedSample]) -> None:
 def prepare_datasets(
     args: argparse.Namespace, work_dir: Path, tokenizer: Any
 ) -> dict[str, Any]:
-    default_task = getattr(args, "task", "ocr")
     observed_tasks: set[str] = set()
     work_dir.mkdir(parents=True, exist_ok=True)
     prepared_dir = work_dir / "prepared"
@@ -514,6 +661,9 @@ def prepare_datasets(
             train_split, validation_split, train_name, validation_name = select_splits(
                 dataset
             )
+            default_task = dataset_default_task(
+                args, dataset_index, train_split, validation_split
+            )
             train_samples = process_split(
                 train_split,
                 dataset_dir,
@@ -524,7 +674,8 @@ def prepare_datasets(
                 args.max_seq_len,
                 tokenizer,
                 report,
-                visual_token_reserve(args.max_pixels),
+                args.min_pixels,
+                args.max_pixels,
                 default_task,
             )
             observed_tasks.update(task_for_prompt(sample.prompt) for sample in train_samples)
@@ -546,7 +697,8 @@ def prepare_datasets(
                     args.max_seq_len,
                     tokenizer,
                     report,
-                    visual_token_reserve(args.max_pixels),
+                    args.min_pixels,
+                    args.max_pixels,
                     default_task,
                 )
             observed_tasks.update(
@@ -568,6 +720,7 @@ def prepare_datasets(
             source_summaries.append(
                 {
                     "dataset": str(dataset_dir),
+                    "default_task": default_task,
                     "train_split": train_name,
                     "validation_split": validation_name,
                     "train_samples": len(train_samples),
@@ -668,6 +821,13 @@ def _validate_prepared_jsonl(
                 or not target["text"]
             ):
                 raise ValueError(f"Invalid task mask contract in {path}:{line_number}")
+            task = task_for_prompt(prompt_row["text"])
+            try:
+                validate_target_for_task(target["text"], task)
+            except ValueError as exc:
+                raise ValueError(
+                    f"Invalid {task} target schema in {path}:{line_number}: {exc}"
+                ) from exc
 
             image_path = _resolve_reused_path(
                 image.get("image_url"), path.parent, "image_url"
@@ -1033,6 +1193,13 @@ def resolve_run_model(config_path: Path, requested_model: str) -> Path:
     return resolved
 
 
+def validate_work_dir_isolation(work_dir: Path, model: Path) -> None:
+    resolved_work_dir = work_dir.expanduser().resolve()
+    resolved_model = model.expanduser().resolve()
+    if resolved_work_dir == resolved_model or resolved_model in resolved_work_dir.parents:
+        raise ValueError("--work-dir must be outside the immutable base model snapshot")
+
+
 def validate_adapter_base_model(adapter_dir: Path, model: Path) -> None:
     config_path = adapter_dir / "lora_config.json"
     if not config_path.is_file():
@@ -1370,11 +1537,16 @@ def build_evaluation_command(
     validation_jsonls: Sequence[Path],
     samples_per_dataset: int,
     max_new_tokens: int,
+    task_max_new_tokens: Sequence[str] = (),
+    min_normalized_edit_distance: float = 0.5,
+    max_cer: float = 1.0,
+    base_predictions_jsonl: Path | None = None,
+    report_only: bool = False,
     output_dir: Path | None = None,
 ) -> list[str]:
     entrypoint = Path(__file__).with_name("evaluate_paddleocr_vl.py").resolve()
     metrics_dir = (output_dir or (work_dir / "metrics")).resolve()
-    return [
+    command = [
         str((evaluation_venv / "bin" / "python").resolve()),
         str(entrypoint),
         "--base-model",
@@ -1389,7 +1561,20 @@ def build_evaluation_command(
         str(samples_per_dataset),
         "--max-new-tokens",
         str(max_new_tokens),
+        "--min-normalized-edit-distance",
+        str(min_normalized_edit_distance),
+        "--max-cer",
+        str(max_cer),
     ]
+    for value in task_max_new_tokens:
+        command.extend(("--task-max-new-tokens", value))
+    if base_predictions_jsonl is not None:
+        command.extend(
+            ("--base-predictions-jsonl", str(base_predictions_jsonl.resolve()))
+        )
+    if report_only:
+        command.append("--report-only")
+    return command
 
 
 def copy_inference_assets(model: str, export_dir: Path) -> list[str]:
@@ -1425,6 +1610,31 @@ def copy_inference_assets(model: str, export_dir: Path) -> list[str]:
     return copied
 
 
+def promote_export_directory(candidate: Path, destination: Path) -> None:
+    """Replace an export only after its candidate has been fully verified."""
+    candidate = candidate.resolve()
+    destination = destination.expanduser().absolute()
+    if candidate.parent != destination.parent:
+        raise ValueError("Export candidate and destination must share a parent")
+    if destination.is_symlink() or (destination.exists() and not destination.is_dir()):
+        raise ValueError("Existing export destination must be a real directory")
+    backup: Path | None = None
+    if destination.exists():
+        backup = Path(
+            tempfile.mkdtemp(prefix=f".{destination.name}-previous-", dir=destination.parent)
+        )
+        backup.rmdir()
+        os.replace(destination, backup)
+    try:
+        os.replace(candidate, destination)
+    except BaseException:
+        if backup is not None:
+            os.replace(backup, destination)
+        raise
+    if backup is not None:
+        shutil.rmtree(backup)
+
+
 def _edit_distance(left: str, right: str) -> int:
     previous = list(range(len(right) + 1))
     for left_index, left_char in enumerate(left, 1):
@@ -1441,7 +1651,7 @@ def _edit_distance(left: str, right: str) -> int:
     return previous[-1]
 
 
-def _metric_group(rows: Sequence[Mapping[str, str]]) -> dict[str, float | int]:
+def _metric_group(rows: Sequence[Mapping[str, Any]]) -> dict[str, float | int]:
     edits = sum(_edit_distance(row["target"], row["prediction"]) for row in rows)
     characters = sum(len(row["target"]) for row in rows)
     exact = sum(row["target"] == row["prediction"] for row in rows)
@@ -1459,14 +1669,22 @@ def _metric_group(rows: Sequence[Mapping[str, str]]) -> dict[str, float | int]:
     }
 
 
-def compute_ocr_metrics(rows: Sequence[Mapping[str, str]]) -> dict[str, Any]:
-    groups: dict[str, list[Mapping[str, str]]] = defaultdict(list)
+def compute_ocr_metrics(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    dataset_groups: dict[str, list[Mapping[str, Any]]] = defaultdict(list)
+    task_groups: dict[str, list[Mapping[str, Any]]] = defaultdict(list)
     for row in rows:
-        groups[row["dataset"]].append(row)
+        dataset_groups[row["dataset"]].append(row)
+        task = row.get("task")
+        if isinstance(task, str):
+            task_groups[task].append(row)
     return {
         "overall": _metric_group(rows),
         "datasets": {
-            name: _metric_group(group) for name, group in sorted(groups.items())
+            name: _metric_group(group)
+            for name, group in sorted(dataset_groups.items())
+        },
+        "tasks": {
+            name: _metric_group(group) for name, group in sorted(task_groups.items())
         },
     }
 
@@ -1481,6 +1699,7 @@ def select_best_checkpoint(
         key=lambda report: (
             float(report["cer"]),
             -float(report["exact_match"]),
+            -float(report.get("normalized_edit_distance", 0.0)),
             str(report["checkpoint"]),
         ),
     )
@@ -1501,6 +1720,133 @@ def resolve_selected_adapter(work_dir: Path, selection: Mapping[str, Any]) -> Pa
     if not (selected / "lora_config.json").is_file():
         raise FileNotFoundError(f"Selected checkpoint is incomplete: {selected}")
     return selected
+
+
+def adapter_candidates(work_dir: Path, max_checkpoints: int) -> list[Path]:
+    adapter_root = (work_dir / "adapter").resolve()
+    checkpoints = sorted(
+        (
+            path
+            for path in adapter_root.glob("checkpoint-*")
+            if path.is_dir()
+            and re.fullmatch(r"checkpoint-\d+", path.name)
+            and (path / "lora_config.json").is_file()
+        ),
+        key=lambda path: int(path.name.removeprefix("checkpoint-")),
+        reverse=True,
+    )[:max_checkpoints]
+    return [adapter_root, *checkpoints]
+
+
+def evaluate_adapter_candidates(
+    args: argparse.Namespace,
+    work_dir: Path,
+    run_model: Path,
+    validation_jsonls: Sequence[Path],
+    fixture_jsonl: Path,
+    evaluation_samples: int,
+) -> tuple[Path, dict[str, Any]]:
+    evaluation_venv = Path(__file__).with_name(".venv-vl-eval")
+    scratch_root = work_dir / ".checkpoint-evaluation"
+    metrics_root = work_dir / "metrics" / "checkpoints"
+    reports: list[dict[str, Any]] = []
+    base_predictions_jsonl: Path | None = None
+    try:
+        for adapter_dir in adapter_candidates(work_dir, args.eval_max_checkpoints):
+            validate_adapter_scope(adapter_dir)
+            validate_adapter_base_model(adapter_dir, run_model)
+            checkpoint = (
+                "adapter"
+                if adapter_dir == (work_dir / "adapter").resolve()
+                else adapter_dir.name
+            )
+            candidate_export = scratch_root / checkpoint
+            candidate_metrics = metrics_root / checkpoint
+            shutil.rmtree(candidate_export, ignore_errors=True)
+            shutil.rmtree(candidate_metrics, ignore_errors=True)
+            run_logged_command(
+                build_export_command(
+                    args.erniekit_dir,
+                    str(run_model),
+                    work_dir,
+                    fixture_jsonl=fixture_jsonl,
+                    min_pixels=args.min_pixels,
+                    max_pixels=args.max_pixels,
+                    adapter_dir=adapter_dir,
+                    output_dir=candidate_export,
+                ),
+                args.erniekit_dir.resolve(),
+                work_dir / "logs" / f"checkpoint-export-{checkpoint}.log",
+                capture_output=False,
+                env_overrides={"CUDA_VISIBLE_DEVICES": args.devices},
+            )
+            copy_inference_assets(str(run_model), candidate_export)
+            run_logged_command(
+                build_evaluation_command(
+                    evaluation_venv,
+                    str(run_model),
+                    work_dir,
+                    merged_model=candidate_export,
+                    validation_jsonls=validation_jsonls,
+                    samples_per_dataset=evaluation_samples,
+                    max_new_tokens=args.eval_max_new_tokens,
+                    task_max_new_tokens=args.eval_task_max_new_tokens,
+                    min_normalized_edit_distance=args.min_normalized_edit_distance,
+                    max_cer=args.max_cer,
+                    base_predictions_jsonl=base_predictions_jsonl,
+                    report_only=True,
+                    output_dir=candidate_metrics,
+                ),
+                Path(__file__).resolve().parent,
+                work_dir / "logs" / f"checkpoint-evaluation-{checkpoint}.log",
+                capture_output=False,
+                env_overrides={"CUDA_VISIBLE_DEVICES": args.devices},
+            )
+            report = json.loads(
+                (candidate_metrics / "ocr_metrics.json").read_text(encoding="utf-8")
+            )
+            if base_predictions_jsonl is None:
+                base_predictions_jsonl = candidate_metrics / "ocr_predictions.jsonl"
+                if not base_predictions_jsonl.is_file():
+                    raise FileNotFoundError(
+                        f"Candidate evaluation omitted predictions: {base_predictions_jsonl}"
+                    )
+            overall = report["candidates"]["merged"]["overall"]
+            reports.append(
+                {
+                    "checkpoint": checkpoint,
+                    "status": report.get("status"),
+                    "failures": report.get("failures", []),
+                    **overall,
+                }
+            )
+            shutil.rmtree(candidate_export, ignore_errors=True)
+    finally:
+        shutil.rmtree(scratch_root, ignore_errors=True)
+
+    passing = [report for report in reports if report["status"] == "passed"]
+    eligible = passing or (reports if args.smoke_steps is not None else [])
+    if not eligible:
+        selection_report = {"status": "failed", "candidates": reports}
+        metrics_root.mkdir(parents=True, exist_ok=True)
+        (work_dir / "metrics" / "checkpoint_selection.json").write_text(
+            json.dumps(selection_report, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        raise RuntimeError("No adapter checkpoint passed the native OCR quality gate")
+    selected = dict(select_best_checkpoint(eligible))
+    selection_report = {
+        "status": "passed" if selected["status"] == "passed" else "failed",
+        "selected": selected,
+        "candidates": reports,
+        "base_predictions_jsonl": str(base_predictions_jsonl.resolve()),
+    }
+    (work_dir / "metrics").mkdir(parents=True, exist_ok=True)
+    (work_dir / "metrics" / "checkpoint_selection.json").write_text(
+        json.dumps(selection_report, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    return resolve_selected_adapter(work_dir, selected), selection_report
 
 
 def export_verification_status(
@@ -1556,6 +1902,7 @@ def main(
 
     assert args.erniekit_dir is not None
     run_model = resolve_run_model(config_path, args.model)
+    validate_work_dir_isolation(work_dir, run_model)
     inspect_model(args.erniekit_dir, config_path, work_dir, args.devices)
     if args.inspect_model:
         return 0
@@ -1585,68 +1932,100 @@ def main(
     evaluation_samples = (
         1 if args.smoke_steps is not None else args.eval_samples_per_dataset
     )
-    selected_adapter = (work_dir / "adapter").resolve()
-
     create_export_config(work_dir, str(run_model))
     fixture_jsonl = Path(summary["sources"][0]["validation_jsonl"])
+    checkpoint_selection = None
+    if args.skip_evaluation:
+        selected_adapter = (work_dir / "adapter").resolve()
+    else:
+        selected_adapter, checkpoint_selection = evaluate_adapter_candidates(
+            args,
+            work_dir,
+            run_model,
+            validation_jsonls,
+            fixture_jsonl,
+            evaluation_samples,
+        )
     export_dir = work_dir / "adapter" / "export"
-    export_command = build_export_command(
-        args.erniekit_dir,
-        str(run_model),
-        work_dir,
-        fixture_jsonl=fixture_jsonl,
-        min_pixels=args.min_pixels,
-        max_pixels=args.max_pixels,
-        adapter_dir=selected_adapter,
-        output_dir=export_dir,
+    candidate_export = Path(
+        tempfile.mkdtemp(prefix=".export-build-", dir=export_dir.parent)
     )
-    run_logged_command(
-        export_command,
-        args.erniekit_dir.resolve(),
-        work_dir / "logs" / "export.log",
-        capture_output=False,
-        env_overrides={"CUDA_VISIBLE_DEVICES": args.devices},
-    )
-    copied = copy_inference_assets(str(run_model), export_dir)
-    weight_verification = json.loads(
-        (export_dir / "merge_verification.json").read_text(encoding="utf-8")
-    )
-    logits_verification = json.loads(
-        (export_dir / "logits_verification.json").read_text(encoding="utf-8")
-    )
-    if weight_verification.get("status") != "passed":
-        raise RuntimeError("Merged model verification did not pass")
-    if logits_verification.get("status") != "passed":
-        raise RuntimeError("Merged model logits verification did not pass")
-
-    evaluation_report = None
-    if not args.skip_evaluation:
-        evaluation_venv = Path(__file__).with_name(".venv-vl-eval")
-        evaluation_command = build_evaluation_command(
-            evaluation_venv,
+    try:
+        export_command = build_export_command(
+            args.erniekit_dir,
             str(run_model),
             work_dir,
-            merged_model=export_dir,
-            validation_jsonls=validation_jsonls,
-            samples_per_dataset=evaluation_samples,
-            max_new_tokens=args.eval_max_new_tokens,
-            output_dir=work_dir / "metrics",
+            fixture_jsonl=fixture_jsonl,
+            min_pixels=args.min_pixels,
+            max_pixels=args.max_pixels,
+            adapter_dir=selected_adapter,
+            output_dir=candidate_export,
         )
         run_logged_command(
-            evaluation_command,
-            Path(__file__).resolve().parent,
-            work_dir / "logs" / "evaluation.log",
+            export_command,
+            args.erniekit_dir.resolve(),
+            work_dir / "logs" / "export.log",
             capture_output=False,
             env_overrides={"CUDA_VISIBLE_DEVICES": args.devices},
         )
-        evaluation_report = json.loads(
-            (work_dir / "metrics" / "ocr_metrics.json").read_text(encoding="utf-8")
+        copied = copy_inference_assets(str(run_model), candidate_export)
+        weight_verification = json.loads(
+            (candidate_export / "merge_verification.json").read_text(encoding="utf-8")
         )
+        logits_verification = json.loads(
+            (candidate_export / "logits_verification.json").read_text(encoding="utf-8")
+        )
+        if weight_verification.get("status") != "passed":
+            raise RuntimeError("Merged model verification did not pass")
+        if logits_verification.get("status") != "passed":
+            raise RuntimeError("Merged model logits verification did not pass")
+
+        evaluation_report = None
+        if not args.skip_evaluation:
+            evaluation_venv = Path(__file__).with_name(".venv-vl-eval")
+            base_predictions_jsonl = Path(
+                checkpoint_selection["base_predictions_jsonl"]
+            )
+            evaluation_command = build_evaluation_command(
+                evaluation_venv,
+                str(run_model),
+                work_dir,
+                merged_model=candidate_export,
+                validation_jsonls=validation_jsonls,
+                samples_per_dataset=evaluation_samples,
+                max_new_tokens=args.eval_max_new_tokens,
+                task_max_new_tokens=args.eval_task_max_new_tokens,
+                min_normalized_edit_distance=args.min_normalized_edit_distance,
+                max_cer=args.max_cer,
+                base_predictions_jsonl=base_predictions_jsonl,
+                report_only=args.smoke_steps is not None,
+                output_dir=work_dir / "metrics",
+            )
+            run_logged_command(
+                evaluation_command,
+                Path(__file__).resolve().parent,
+                work_dir / "logs" / "evaluation.log",
+                capture_output=False,
+                env_overrides={"CUDA_VISIBLE_DEVICES": args.devices},
+            )
+            evaluation_report = json.loads(
+                (work_dir / "metrics" / "ocr_metrics.json").read_text(encoding="utf-8")
+            )
+        if (
+            evaluation_report is not None
+            and evaluation_report.get("status") != "passed"
+            and args.smoke_steps is None
+        ):
+            raise RuntimeError("Native OCR evaluation did not pass")
+        promote_export_directory(candidate_export, export_dir)
+    finally:
+        shutil.rmtree(candidate_export, ignore_errors=True)
 
     manifest = {
         "status": export_verification_status(args.skip_evaluation, evaluation_report),
         "adapter_dir": str((work_dir / "adapter").resolve()),
         "selected_adapter_dir": str(selected_adapter),
+        "checkpoint_selection": checkpoint_selection,
         "merged_model_dir": str(export_dir.resolve()),
         "copied_assets": copied,
         "verification": {
@@ -1666,12 +2045,6 @@ def main(
     (work_dir / "export_manifest.json").write_text(
         json.dumps(manifest, indent=2) + "\n", encoding="utf-8"
     )
-    if (
-        evaluation_report is not None
-        and evaluation_report.get("status") != "passed"
-        and args.smoke_steps is None
-    ):
-        raise RuntimeError("Native OCR evaluation did not pass")
     return 0
 
 
@@ -1680,10 +2053,3 @@ if __name__ == "__main__":
         level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s"
     )
     raise SystemExit(main())
-    allowed = (
-        set(TASK_PROMPTS.values())
-        if allowed_prompts is None
-        else set(allowed_prompts)
-    )
-    if not allowed:
-        raise ValueError("Prepared JSONL validation requires at least one allowed prompt")

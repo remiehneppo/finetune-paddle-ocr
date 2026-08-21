@@ -32,7 +32,24 @@
       <div id="editor" hidden>
         <label>Layout label<select id="layout-label"></select></label>
         <label>Task<select id="task"><option value="ocr">ocr</option><option value="table">table</option><option value="formula">formula</option><option value="chart">chart</option><option value="">Không xuất VL</option></select></label>
-        <label>Text<textarea id="text"></textarea></label>
+        <section id="target-editor" class="target-editor">
+          <div class="target-heading">
+            <div><strong>Output training</strong><span id="target-format" class="format-badge"></span></div>
+            <div class="target-tabs" role="tablist" aria-label="Chế độ chỉnh output">
+              <button id="visual-tab" class="active" type="button" role="tab" aria-selected="true" aria-controls="visual-panel">Trực quan</button>
+              <button id="raw-tab" type="button" role="tab" aria-selected="false" aria-controls="raw-panel" tabindex="-1">Raw</button>
+            </div>
+          </div>
+          <div id="target-message" class="target-message" role="status" aria-live="polite"></div>
+          <div id="visual-panel" role="tabpanel" aria-labelledby="visual-tab">
+            <div id="visual-editor"></div>
+            <button id="starter-target" class="secondary" type="button" hidden>Tạo cấu trúc trống</button>
+          </div>
+          <div id="raw-panel" role="tabpanel" aria-labelledby="raw-tab" hidden>
+            <label>Raw output<textarea id="text" spellcheck="false"></textarea></label>
+            <p class="muted">Raw luôn được giữ nguyên khi chưa thể ánh xạ sang giao diện trực quan.</p>
+          </div>
+        </section>
         <div id="layout-only-note" class="muted" hidden>Block layout-only: không prelabel và không xuất HF.</div>
         <label class="inline"><input id="skipped" type="checkbox" /> Bỏ qua block</label>
         <div class="muted" id="block-meta"></div><button id="delete-block" class="danger">Xóa block</button>
