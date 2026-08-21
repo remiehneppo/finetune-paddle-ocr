@@ -197,12 +197,20 @@ function renderFormulaEditor(container, model) {
 }
 
 function renderOtslEditor(container, model) {
-  const wrapper = element("div", "table-scroll");
-  const table = element("table", "html-table-editor");
+  const wrapper = element("div", "table-scroll table-workspace-scroll");
+  const table = element("table", "html-table-editor compact-table-editor");
   const body = element("tbody");
-  const mergeText = (first, second) => [first, second].filter(Boolean).join("\n");
-  const merge = (cell, direction) => {
-    const adjacent = direction === "right"
+  const workspace = element("div", "table-editor-workspace");
+  const toolbar = element("div", "table-toolbar");
+  const structureActions = element("div", "table-toolbar-group table-structure-actions");
+  const cellActions = element("div", "table-toolbar-group table-cell-actions");
+  const activeLabel = element("span", "active-cell-label", "Chọn một ô");
+  let activeCell = model.cells[0] || null;
+  let activeHolder = null;
+
+  const adjacentCell = (cell, direction) => {
+    if (!cell) return null;
+    return direction === "right"
       ? model.cells.find((candidate) => (
         candidate.row === cell.row
         && candidate.column === cell.column + cell.colspan
@@ -213,6 +221,11 @@ function renderOtslEditor(container, model) {
         && candidate.column === cell.column
         && candidate.colspan === cell.colspan
       ));
+  };
+
+  const mergeText = (first, second) => [first, second].filter(Boolean).join("\n");
+  const merge = (cell, direction) => {
+    const adjacent = adjacentCell(cell, direction);
     if (!adjacent) return;
     const next = cloneTargetModel(model);
     const target = next.cells.find(
@@ -226,7 +239,9 @@ function renderOtslEditor(container, model) {
     );
     commitVisualModel("table", next, { rerender: true });
   };
+
   const split = (cell) => {
+    if (!cell || (cell.rowspan === 1 && cell.colspan === 1)) return;
     const next = cloneTargetModel(model);
     next.cells = next.cells.filter(
       (candidate) => candidate.row !== cell.row || candidate.column !== cell.column,
@@ -244,6 +259,74 @@ function renderOtslEditor(container, model) {
     }
     commitVisualModel("table", next, { rerender: true });
   };
+
+  const mergeRight = targetButton("Gộp →", () => merge(activeCell, "right"), "icon");
+  const mergeDown = targetButton("Gộp ↓", () => merge(activeCell, "down"), "icon");
+  const splitCell = targetButton("Tách", () => split(activeCell), "icon");
+  const updateCellToolbar = () => {
+    const spanText = activeCell && (activeCell.rowspan > 1 || activeCell.colspan > 1)
+      ? ` · gộp ${activeCell.rowspan}×${activeCell.colspan}`
+      : "";
+    activeLabel.textContent = activeCell
+      ? `Ô ${activeCell.row + 1}, ${activeCell.column + 1}${spanText}`
+      : "Chọn một ô";
+    mergeRight.disabled = !adjacentCell(activeCell, "right");
+    mergeDown.disabled = !adjacentCell(activeCell, "down");
+    splitCell.disabled = !activeCell || (activeCell.rowspan === 1 && activeCell.colspan === 1);
+  };
+  const selectCell = (cell, holder) => {
+    activeHolder?.classList.remove("active-cell");
+    activeCell = cell;
+    activeHolder = holder;
+    activeHolder.classList.add("active-cell");
+    updateCellToolbar();
+  };
+
+  structureActions.append(
+    targetButton("+ Hàng", () => {
+      const next = cloneTargetModel(model);
+      for (let column = 0; column < next.columnCount; column += 1) {
+        next.cells.push({ row: next.rowCount, column, rowspan: 1, colspan: 1, text: "" });
+      }
+      next.rowCount += 1;
+      commitVisualModel("table", next, { rerender: true });
+    }, "icon"),
+    targetButton("+ Cột", () => {
+      const next = cloneTargetModel(model);
+      for (let row = 0; row < next.rowCount; row += 1) {
+        next.cells.push({ row, column: next.columnCount, rowspan: 1, colspan: 1, text: "" });
+      }
+      next.columnCount += 1;
+      commitVisualModel("table", next, { rerender: true });
+    }, "icon"),
+    targetButton("− Hàng", () => {
+      if (model.rowCount === 1) return;
+      const lastRow = model.rowCount - 1;
+      const next = cloneTargetModel(model);
+      next.cells = next.cells.flatMap((cell) => {
+        if (cell.row === lastRow) return [];
+        if (cell.row + cell.rowspan - 1 === lastRow) return [{ ...cell, rowspan: cell.rowspan - 1 }];
+        return [cell];
+      });
+      next.rowCount -= 1;
+      commitVisualModel("table", next, { rerender: true });
+    }, "icon danger"),
+    targetButton("− Cột", () => {
+      if (model.columnCount === 1) return;
+      const lastColumn = model.columnCount - 1;
+      const next = cloneTargetModel(model);
+      next.cells = next.cells.flatMap((cell) => {
+        if (cell.column === lastColumn) return [];
+        if (cell.column + cell.colspan - 1 === lastColumn) return [{ ...cell, colspan: cell.colspan - 1 }];
+        return [cell];
+      });
+      next.columnCount -= 1;
+      commitVisualModel("table", next, { rerender: true });
+    }, "icon danger"),
+  );
+  cellActions.append(activeLabel, mergeRight, mergeDown, splitCell);
+  toolbar.append(structureActions, cellActions);
+
   for (let rowIndex = 0; rowIndex < model.rowCount; rowIndex += 1) {
     const row = element("tr");
     const cells = model.cells
@@ -255,91 +338,37 @@ function renderOtslEditor(container, model) {
       holder.colSpan = cell.colspan;
       const input = element("textarea", "cell-input");
       input.value = cell.text;
+      input.rows = Math.max(2, Math.min(6, cell.text.split("\n").length));
       input.placeholder = "Nội dung ô";
       input.setAttribute("aria-label", `Nội dung hàng ${rowIndex + 1}, cột ${cell.column + 1}`);
+      input.addEventListener("focus", () => selectCell(cell, holder));
+      holder.addEventListener("pointerdown", () => selectCell(cell, holder));
       input.oninput = (event) => {
         cell.text = event.target.value;
+        input.rows = Math.max(2, Math.min(6, cell.text.split("\n").length));
         commitVisualModel("table", model);
       };
-      const actions = element("div", "cell-actions");
-      const mergeRight = targetButton("Gộp →", () => merge(cell, "right"), "icon");
-      mergeRight.disabled = !model.cells.some((candidate) => (
-        candidate.row === cell.row
-        && candidate.column === cell.column + cell.colspan
-        && candidate.rowspan === cell.rowspan
-      ));
-      const mergeDown = targetButton("Gộp ↓", () => merge(cell, "down"), "icon");
-      mergeDown.disabled = !model.cells.some((candidate) => (
-        candidate.row === cell.row + cell.rowspan
-        && candidate.column === cell.column
-        && candidate.colspan === cell.colspan
-      ));
-      const splitCell = targetButton("Tách", () => split(cell), "icon");
-      splitCell.disabled = cell.rowspan === 1 && cell.colspan === 1;
-      actions.append(mergeRight, mergeDown, splitCell);
       const span = element(
         "span",
         "cell-span",
         cell.rowspan > 1 || cell.colspan > 1 ? `${cell.rowspan}×${cell.colspan}` : "",
       );
-      holder.append(input, actions, span);
+      holder.append(input, span);
+      if (cell === activeCell) {
+        activeHolder = holder;
+        holder.classList.add("active-cell");
+      }
       row.append(holder);
     });
     body.append(row);
   }
   table.append(body);
   wrapper.append(table);
-  const controls = element("div", "grid-actions");
-  controls.append(
-    targetButton("+ Hàng", () => {
-      const next = cloneTargetModel(model);
-      for (let column = 0; column < next.columnCount; column += 1) {
-        next.cells.push({
-          row: next.rowCount, column, rowspan: 1, colspan: 1, text: "",
-        });
-      }
-      next.rowCount += 1;
-      commitVisualModel("table", next, { rerender: true });
-    }),
-    targetButton("+ Cột", () => {
-      const next = cloneTargetModel(model);
-      for (let row = 0; row < next.rowCount; row += 1) {
-        next.cells.push({
-          row, column: next.columnCount, rowspan: 1, colspan: 1, text: "",
-        });
-      }
-      next.columnCount += 1;
-      commitVisualModel("table", next, { rerender: true });
-    }),
-    targetButton("− Hàng cuối", () => {
-      if (model.rowCount === 1) return;
-      const lastRow = model.rowCount - 1;
-      const next = cloneTargetModel(model);
-      next.cells = next.cells.flatMap((cell) => {
-        if (cell.row === lastRow) return [];
-        if (cell.row + cell.rowspan - 1 === lastRow) return [{ ...cell, rowspan: cell.rowspan - 1 }];
-        return [cell];
-      });
-      next.rowCount -= 1;
-      commitVisualModel("table", next, { rerender: true });
-    }, "secondary danger"),
-    targetButton("− Cột cuối", () => {
-      if (model.columnCount === 1) return;
-      const lastColumn = model.columnCount - 1;
-      const next = cloneTargetModel(model);
-      next.cells = next.cells.flatMap((cell) => {
-        if (cell.column === lastColumn) return [];
-        if (cell.column + cell.colspan - 1 === lastColumn) return [{ ...cell, colspan: cell.colspan - 1 }];
-        return [cell];
-      });
-      next.columnCount -= 1;
-      commitVisualModel("table", next, { rerender: true });
-    }, "secondary danger"),
-  );
+  workspace.append(toolbar, wrapper);
+  updateCellToolbar();
   container.append(
-    element("p", "editor-hint", "Bảng HTML được chuyển hai chiều với OTSL. Gộp/tách ô tương ứng với rowspan và colspan."),
-    wrapper,
-    controls,
+    element("p", "editor-hint table-hint", "Chọn một ô để gộp hoặc tách. Các thao tác cấu trúc nằm cố định phía trên bảng."),
+    workspace,
   );
 }
 

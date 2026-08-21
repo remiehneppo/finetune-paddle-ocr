@@ -5,6 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>PaddleOCR-VL Layout Labeler</title>
   <link rel="stylesheet" href="/static/styles.css" />
+  <link rel="stylesheet" href="/static/inspector.css" />
 </head>
 <body>
   <header class="topbar">
@@ -26,37 +27,66 @@
       <div class="canvas-toolbar"><span id="current-name">Chọn ảnh</span><button id="detect-current">Detect ảnh</button><button id="prelabel-page">Prelabel ảnh</button><button id="prelabel-current">Prelabel chọn</button><button id="add-mode">Thêm bbox</button><button id="complete-current">Complete</button></div>
       <div id="page-stage" tabindex="0"><img id="page-image" alt="Trang tài liệu" /><svg id="overlay"></svg></div>
     </section>
+    <div id="inspector-separator" class="pane-separator" role="separator" aria-label="Điều chỉnh chiều rộng inspector" aria-orientation="vertical" aria-valuemin="340" aria-valuemax="760" aria-valuenow="440" tabindex="0"></div>
     <aside class="inspector">
-      <div class="heading"><strong>Block</strong><span id="block-count">0</span></div>
+      <div class="heading inspector-heading"><div><strong>Block</strong><span id="block-count">0</span></div><button id="editor-focus-toggle" type="button" aria-pressed="false" disabled>Tập trung</button></div>
       <ol id="block-list"></ol>
       <div id="editor" hidden>
-        <label>Layout label<select id="layout-label"></select></label>
-        <label>Task<select id="task"><option value="ocr">ocr</option><option value="table">table</option><option value="formula">formula</option><option value="chart">chart</option><option value="">Không xuất VL</option></select></label>
-        <section id="target-editor" class="target-editor">
-          <div class="target-heading">
-            <div><strong>Output training</strong><span id="target-format" class="format-badge"></span></div>
-            <div class="target-tabs" role="tablist" aria-label="Chế độ chỉnh output">
-              <button id="visual-tab" class="active" type="button" role="tab" aria-selected="true" aria-controls="visual-panel">Trực quan</button>
-              <button id="raw-tab" type="button" role="tab" aria-selected="false" aria-controls="raw-panel" tabindex="-1">Raw</button>
+        <div class="block-fields">
+          <label>Layout label<select id="layout-label"></select></label>
+          <label>Task<select id="task"><option value="ocr">ocr</option><option value="table">table</option><option value="formula">formula</option><option value="chart">chart</option><option value="">Không xuất VL</option></select></label>
+        </div>
+        <div id="editor-split" class="editor-split">
+          <section id="crop-panel" class="crop-panel" aria-labelledby="crop-title">
+            <div class="crop-heading">
+              <div><strong id="crop-title">Ảnh gốc</strong><span id="crop-meta" class="format-badge"></span></div>
+              <div class="crop-controls" aria-label="Điều khiển zoom ảnh crop">
+                <button id="crop-fit" type="button">Fit</button>
+                <button id="crop-actual" type="button">100%</button>
+                <button id="crop-zoom-out" type="button" aria-label="Thu nhỏ crop">−</button>
+                <span id="crop-zoom-value">Fit</span>
+                <button id="crop-zoom-in" type="button" aria-label="Phóng to crop">+</button>
+              </div>
             </div>
+            <div id="crop-viewport" class="crop-viewport" tabindex="0">
+              <div id="crop-space" class="crop-space">
+                <div id="crop-clip" class="crop-clip"><img id="crop-image" alt="Crop của block đang chọn" /></div>
+              </div>
+            </div>
+          </section>
+          <div id="crop-editor-separator" class="split-separator" role="separator" aria-label="Điều chỉnh chiều cao ảnh crop" aria-orientation="horizontal" aria-valuemin="130" aria-valuemax="600" aria-valuenow="260" tabindex="0"></div>
+          <div class="editor-scroll">
+            <section id="target-editor" class="target-editor">
+              <div class="target-heading">
+                <div><strong>Output training</strong><span id="target-format" class="format-badge"></span></div>
+                <div class="target-tabs" role="tablist" aria-label="Chế độ chỉnh output">
+                  <button id="visual-tab" class="active" type="button" role="tab" aria-selected="true" aria-controls="visual-panel">Trực quan</button>
+                  <button id="raw-tab" type="button" role="tab" aria-selected="false" aria-controls="raw-panel" tabindex="-1">Raw</button>
+                </div>
+              </div>
+              <div id="target-message" class="target-message" role="status" aria-live="polite"></div>
+              <div id="visual-panel" role="tabpanel" aria-labelledby="visual-tab">
+                <div id="visual-editor"></div>
+                <button id="starter-target" class="secondary" type="button" hidden>Tạo cấu trúc trống</button>
+              </div>
+              <div id="raw-panel" role="tabpanel" aria-labelledby="raw-tab" hidden>
+                <label>Raw output<textarea id="text" spellcheck="false"></textarea></label>
+                <p class="muted">Raw luôn được giữ nguyên khi chưa thể ánh xạ sang giao diện trực quan.</p>
+              </div>
+            </section>
+            <details class="block-options">
+              <summary>Tùy chọn block</summary>
+              <div id="layout-only-note" class="muted" hidden>Block layout-only: không prelabel và không xuất HF.</div>
+              <label class="inline"><input id="skipped" type="checkbox" /> Bỏ qua block</label>
+              <div class="muted" id="block-meta"></div><button id="delete-block" class="danger">Xóa block</button>
+            </details>
           </div>
-          <div id="target-message" class="target-message" role="status" aria-live="polite"></div>
-          <div id="visual-panel" role="tabpanel" aria-labelledby="visual-tab">
-            <div id="visual-editor"></div>
-            <button id="starter-target" class="secondary" type="button" hidden>Tạo cấu trúc trống</button>
-          </div>
-          <div id="raw-panel" role="tabpanel" aria-labelledby="raw-tab" hidden>
-            <label>Raw output<textarea id="text" spellcheck="false"></textarea></label>
-            <p class="muted">Raw luôn được giữ nguyên khi chưa thể ánh xạ sang giao diện trực quan.</p>
-          </div>
-        </section>
-        <div id="layout-only-note" class="muted" hidden>Block layout-only: không prelabel và không xuất HF.</div>
-        <label class="inline"><input id="skipped" type="checkbox" /> Bỏ qua block</label>
-        <div class="muted" id="block-meta"></div><button id="delete-block" class="danger">Xóa block</button>
+        </div>
       </div>
-      <div class="export-box"><label>Output folder<input id="export-path" placeholder="/tmp/document-layout-export" /></label><div class="export-actions"><button id="export-hf">Export HF</button><button id="export-layout">Export Layout</button><button id="export-all">Export All</button></div></div>
+      <details class="export-box"><summary>Xuất dữ liệu</summary><label>Output folder<input id="export-path" placeholder="/tmp/document-layout-export" /></label><div class="export-actions"><button id="export-hf">Export HF</button><button id="export-layout">Export Layout</button><button id="export-all">Export All</button></div></details>
     </aside>
   </main>
   <script type="module" src="/static/app.mjs"></script>
+  <script type="module" src="/static/inspector_ui.mjs"></script>
 </body>
 </html>
