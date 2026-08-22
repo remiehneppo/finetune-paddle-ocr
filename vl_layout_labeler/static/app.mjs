@@ -11,7 +11,7 @@ const svg = (name) => document.createElementNS("http://www.w3.org/2000/svg", nam
 const state = {
   images: [], current: null, currentId: null, selected: null,
   view: { scale: 1, x: 0, y: 0 }, add: false, dirty: false, timer: null, drag: null,
-  targetMode: "visual", targetError: null,
+  targetMode: "visual", targetError: null, busy: null, batchBusy: null,
 };
 
 async function api(path, options = {}) {
@@ -25,7 +25,68 @@ async function api(path, options = {}) {
 }
 
 function setStatus(text) { $("save-status").textContent = text; }
-function selectedBlock() { return state.current?.blocks.find((block) => block.id === state.selected) || null; }
+function blockById(id) { return state.current?.blocks.find((block) => block.id === id) || null; }
+function selectedBlock() { return blockById(state.selected); }
+const IMAGE_STATUS_LABELS = {
+  draft: "Draft",
+  detected: "Đã detect",
+  edited: "Đang chỉnh sửa",
+  completed: "✓ Complete",
+};
+const OPERATION_LABELS = {
+  detect: "Model đang detect layout…",
+  prelabel: "Model đang prelabel nội dung…",
+  complete: "Đang hoàn tất ảnh…",
+  draft: "Đang mở lại chế độ chỉnh sửa…",
+  "batch-detect": "Model đang detect toàn bộ folder…",
+  "batch-prelabel": "Model đang prelabel toàn bộ folder…",
+};
+function isCompleted() { return state.current?.status === "completed"; }
+function editingLocked() { return isCompleted() || Boolean(state.busy); }
+function currentOperation() { return state.busy || state.batchBusy; }
+function setBusy(action) {
+  state.busy = action;
+  renderInteractionState();
+}
+function setBatchBusy(action) {
+  state.batchBusy = action;
+  renderInteractionState();
+}
+function renderInteractionState() {
+  const completed = isCompleted();
+  const operation = currentOperation();
+  const processing = Boolean(operation);
+  const noCurrent = !state.current;
+  const block = selectedBlock();
+  const operationStatus = $("operation-status");
+  operationStatus.hidden = !processing;
+  $("operation-message").textContent = OPERATION_LABELS[operation] || "Đang xử lý…";
+  $("completed-banner").hidden = !completed;
+  $("complete-current").hidden = completed;
+  $("reopen-current").hidden = !completed;
+  $("complete-current").disabled = noCurrent || processing;
+  $("reopen-current").disabled = noCurrent || processing;
+  $("detect-current").disabled = noCurrent || completed || processing;
+  $("prelabel-page").disabled = noCurrent || completed || processing;
+  $("prelabel-current").disabled = (
+    noCurrent || completed || processing || !block || block.task === null || block.skipped
+  );
+  $("add-mode").disabled = noCurrent || completed || processing;
+  $("detect-batch").disabled = processing;
+  $("prelabel-batch").disabled = processing;
+  $("cancel-batch").disabled = !state.batchBusy;
+  $("open-folder").disabled = processing;
+  $("folder-path").disabled = processing;
+  $("page-stage").classList.toggle("read-only", completed || Boolean(state.busy));
+  $("page-stage").setAttribute("aria-busy", String(Boolean(state.busy)));
+  document.querySelector(".canvas-panel").setAttribute("aria-busy", String(processing));
+  const locked = completed || Boolean(state.busy);
+  $("editor").querySelectorAll(
+    ".block-fields input, .block-fields textarea, .block-fields select, "
+      + "#target-editor input, #target-editor textarea, #target-editor select, #target-editor button, "
+      + ".block-options input, .block-options textarea, .block-options select, .block-options button",
+  ).forEach((control) => { control.disabled = locked; });
+}
 function element(name, className, text) {
   const value = document.createElement(name);
   if (className) value.className = className;
@@ -68,14 +129,15 @@ function renderImages() {
   for (const image of state.images) {
     const item = document.createElement("li");
     if (image.image_id === state.currentId) item.classList.add("selected");
+    if (image.status === "completed") item.classList.add("completed");
     const name = document.createElement("span");
     const status = document.createElement("span");
     name.className = "name";
-    status.className = `status${image.error ? " error" : ""}`;
+    status.className = `status ${image.error ? "error" : image.status}`;
     name.textContent = image.name;
-    status.textContent = image.error || image.status;
+    status.textContent = image.error || IMAGE_STATUS_LABELS[image.status] || image.status;
     item.append(name, status);
-    item.onclick = () => loadImage(image.image_id);
+    item.onclick = () => { if (!state.busy) loadImage(image.image_id); };
     list.append(item);
   }
 }
@@ -123,13 +185,14 @@ function targetButton(label, callback, className = "secondary") {
 }
 
 function markBlockEdited(block) {
+  if (editingLocked()) return;
   markManual(block);
-  if (state.current.status === "completed") state.current.status = "edited";
   renderBlocks();
   markDirty();
 }
 
 function commitVisualModel(task, model, { rerender = false } = {}) {
+  if (editingLocked()) return false;
   const block = selectedBlock();
   if (!block || block.task !== task) return false;
   try {
@@ -504,7 +567,7 @@ function render() {
     element.onclick = (event) => { event.stopPropagation(); state.selected = block.id; state.targetError = null; render(); };
     element.onpointerdown = (event) => beginDrag(event, block);
     overlay.append(element);
-    if (block.id === state.selected) {
+    if (block.id === state.selected && !editingLocked()) {
       block.polygon.map(imageToScreen).forEach(([x, y], index) => {
         const corner = svg("circle");
         corner.setAttribute("cx", x);
@@ -516,6 +579,7 @@ function render() {
       });
     }
   }
+  renderInteractionState();
 }
 
 async function loadImages() {
@@ -540,6 +604,7 @@ async function loadImage(id) {
 }
 
 function markDirty() {
+  if (isCompleted()) return;
   state.dirty = true;
   setStatus("Đang chờ lưu…");
   clearTimeout(state.timer);
@@ -562,25 +627,37 @@ async function save() {
 }
 
 function mutate(callback) {
-  if (!state.current) return;
+  if (!state.current || editingLocked()) {
+    if (isCompleted()) setStatus("Ảnh đã Complete. Mở lại chỉnh sửa trước khi thay đổi.");
+    return;
+  }
   callback();
-  if (state.current.status === "completed") state.current.status = "edited";
   render();
   markDirty();
 }
 
 async function runCurrent(action, body) {
-  if (!state.currentId || !(await save())) return;
+  if (!state.currentId || state.busy || state.batchBusy) return;
+  if (isCompleted() && action !== "draft") {
+    setStatus("Ảnh đã Complete. Mở lại chỉnh sửa trước khi chạy model.");
+    return;
+  }
+  setBusy(action);
   try {
+    if (action !== "draft" && !(await save())) return;
     const options = { method: "POST" };
     if (body !== undefined) options.body = JSON.stringify(body);
+    const selectedId = state.selected;
     state.current = await api(`/api/images/${state.currentId}/${action}`, options);
-    state.selected = state.current.blocks[0]?.id || null;
+    state.selected = blockById(selectedId)?.id || state.current.blocks[0]?.id || null;
     render();
     await loadImages();
-    setStatus("Hoàn tất");
+    setStatus(action === "draft" ? "Đã mở lại chế độ chỉnh sửa" : "Hoàn tất");
   } catch (error) {
     setStatus(`Lỗi: ${error.message}`);
+  } finally {
+    setBusy(null);
+    render();
   }
 }
 
@@ -589,20 +666,44 @@ function eventPoint(event) {
   return screenToImage([event.clientX - bounds.left, event.clientY - bounds.top]);
 }
 function beginDrag(event, block) {
-  if (state.add) return;
+  if (state.add || editingLocked()) return;
   event.preventDefault();
-  state.selected = block.id;
+  const activeBlock = blockById(block.id);
+  if (!activeBlock) return;
+  const selectionChanged = state.selected !== activeBlock.id;
+  state.selected = activeBlock.id;
   state.targetError = null;
-  state.drag = { block, start: eventPoint(event), original: block.polygon.map((point) => [...point]) };
+  if (selectionChanged) render();
+  state.drag = {
+    block: activeBlock,
+    start: eventPoint(event),
+    original: activeBlock.polygon.map((point) => [...point]),
+    pending: null,
+    frame: null,
+  };
 }
 function beginCornerDrag(event, block, corner) {
+  if (editingLocked()) return;
   event.preventDefault();
   event.stopPropagation();
-  state.drag = { block, corner };
+  const activeBlock = blockById(block.id);
+  if (!activeBlock) return;
+  state.drag = { block: activeBlock, corner, pending: null, frame: null };
 }
-window.addEventListener("pointermove", (event) => {
-  if (!state.drag) return;
-  const point = eventPoint(event);
+function renderDraggedBlock(block) {
+  const polygon = $("overlay").querySelector(".bbox.selected");
+  if (!polygon) return;
+  const points = block.polygon.map(imageToScreen);
+  polygon.setAttribute("points", points.map((point) => point.join(",")).join(" "));
+  $("overlay").querySelectorAll(".corner").forEach((corner, index) => {
+    const point = points[index];
+    if (!point) return;
+    corner.setAttribute("cx", point[0]);
+    corner.setAttribute("cy", point[1]);
+  });
+}
+function applyDragPoint(point) {
+  if (!state.drag || !point) return;
   if (state.drag.corner !== undefined) {
     state.drag.block.polygon[state.drag.corner] = [
       Math.max(0, Math.min(state.current.image.width - 1, point[0])),
@@ -616,22 +717,71 @@ window.addEventListener("pointermove", (event) => {
       Math.max(0, Math.min(state.current.image.height - 1, y + dy)),
     ]);
   }
-  render();
+  renderDraggedBlock(state.drag.block);
+}
+function flushDragFrame() {
+  if (!state.drag) return;
+  state.drag.frame = null;
+  const point = state.drag.pending;
+  state.drag.pending = null;
+  applyDragPoint(point);
+}
+function scheduleDragFrame(point) {
+  if (!state.drag) return;
+  state.drag.pending = point;
+  if (state.drag.frame === null) {
+    state.drag.frame = requestAnimationFrame(flushDragFrame);
+  }
+}
+window.addEventListener("pointermove", (event) => {
+  if (!state.drag) return;
+  scheduleDragFrame(eventPoint(event));
 });
-window.addEventListener("pointerup", () => {
+window.addEventListener("pointerup", (event) => {
   if (state.drag) {
+    if (state.drag.frame !== null) cancelAnimationFrame(state.drag.frame);
+    applyDragPoint(eventPoint(event));
     state.drag.block.source = "manual";
     state.drag.block.score = null;
     state.drag = null;
-    if (state.current.status === "completed") state.current.status = "edited";
     markDirty();
   }
 });
 $("page-stage").onpointerdown = (event) => {
-  if (!state.add || event.target !== $("overlay")) return;
+  if (editingLocked() || !state.add || event.target !== $("overlay")) return;
+  event.preventDefault();
+  const stage = $("page-stage");
   const start = eventPoint(event);
+  const preview = svg("polygon");
+  preview.classList.add("bbox", "draw-preview");
+  $("overlay").append(preview);
+  let pending = start;
+  let frame = null;
+  const flush = () => {
+    frame = null;
+    preview.setAttribute(
+      "points",
+      rectangle(start, pending).map(imageToScreen).map((point) => point.join(",")).join(" "),
+    );
+  };
+  const move = (moveEvent) => {
+    pending = eventPoint(moveEvent);
+    if (frame === null) frame = requestAnimationFrame(flush);
+  };
+  const cleanup = () => {
+    if (frame !== null) cancelAnimationFrame(frame);
+    preview.remove();
+    window.removeEventListener("pointermove", move);
+    window.removeEventListener("pointerup", finish);
+    window.removeEventListener("pointercancel", cancel);
+  };
+  const leaveAddMode = () => {
+    state.add = false;
+    $("add-mode").textContent = "Thêm bbox";
+  };
   const finish = (endEvent) => {
     const end = eventPoint(endEvent);
+    cleanup();
     if (Math.abs(end[0] - start[0]) > 3 && Math.abs(end[1] - start[1]) > 3) {
       mutate(() => {
         const id = crypto.randomUUID();
@@ -644,25 +794,45 @@ $("page-stage").onpointerdown = (event) => {
         state.targetError = null;
       });
     }
-    state.add = false;
-    $("add-mode").textContent = "Thêm bbox";
-    window.removeEventListener("pointerup", finish);
+    leaveAddMode();
   };
+  const cancel = () => {
+    cleanup();
+    leaveAddMode();
+  };
+  flush();
+  window.addEventListener("pointermove", move);
   window.addEventListener("pointerup", finish);
+  window.addEventListener("pointercancel", cancel);
+  if (stage.setPointerCapture) stage.setPointerCapture(event.pointerId);
 };
 
 async function startBatch(operation) {
-  try { pollBatch(await api(`/api/batch/${operation}`, { method: "POST" })); }
-  catch (error) { setStatus(`Lỗi batch: ${error.message}`); }
+  if (currentOperation()) return;
+  setBatchBusy(`batch-${operation}`);
+  try {
+    await pollBatch(await api(`/api/batch/${operation}`, { method: "POST" }));
+  } catch (error) {
+    setBatchBusy(null);
+    setStatus(`Lỗi batch: ${error.message}`);
+  }
 }
 async function pollBatch(snapshot) {
   $("batch-progress").max = snapshot.total || 1;
   $("batch-progress").value = snapshot.processed + snapshot.skipped + snapshot.failed;
   $("batch-status").textContent = `${snapshot.state}: ${snapshot.processed}/${snapshot.total}`;
   if (["queued", "running", "cancelling"].includes(snapshot.state)) {
-    setTimeout(async () => pollBatch(await api("/api/batch")), 750);
+    setTimeout(async () => {
+      try {
+        await pollBatch(await api("/api/batch"));
+      } catch (error) {
+        setBatchBusy(null);
+        setStatus(`Lỗi batch: ${error.message}`);
+      }
+    }, 750);
   } else {
     await loadImages();
+    setBatchBusy(null);
     setStatus(`Batch ${snapshot.state}`);
   }
 }
@@ -703,7 +873,8 @@ $("complete-current").onclick = async () => {
   }
   await runCurrent("complete");
 };
-$("add-mode").onclick = () => { state.add = !state.add; $("add-mode").textContent = state.add ? "Hủy thêm bbox" : "Thêm bbox"; };
+$("reopen-current").onclick = () => runCurrent("draft");
+$("add-mode").onclick = () => { if (editingLocked()) return; state.add = !state.add; $("add-mode").textContent = state.add ? "Hủy thêm bbox" : "Thêm bbox"; };
 $("delete-block").onclick = () => mutate(() => {
   state.current.blocks = state.current.blocks.filter((block) => block.id !== state.selected).map((block, index) => ({ ...block, order: index }));
   state.selected = state.current.blocks[0]?.id || null;
@@ -719,7 +890,7 @@ $("task").onchange = (event) => mutate(() => {
 });
 $("text").oninput = (event) => {
   const block = selectedBlock();
-  if (!block || block.task === null) return;
+  if (!block || block.task === null || editingLocked()) return;
   block.text = event.target.value;
   state.targetError = null;
   setTargetMessage(inspectTarget(block.task, block.text));
@@ -766,3 +937,4 @@ for (const label of taxonomy.layout_labels) {
   option.textContent = label;
   $("layout-label").append(option);
 }
+renderInteractionState();

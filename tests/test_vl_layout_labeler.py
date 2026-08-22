@@ -490,11 +490,62 @@ class VLLayoutLabelerTests(unittest.TestCase):
                 self.assertEqual(completed.json()["status"], "completed")
                 edited_payload = completed.json()
                 edited_payload["blocks"][0]["text"] = ""
+                locked_save = client.put(
+                    f"/api/images/{image_id}/annotation", json=edited_payload
+                )
+                self.assertEqual(locked_save.status_code, 409)
+                locked_detect = client.post(
+                    f"/api/images/{image_id}/detect",
+                    json={"replace_existing": True},
+                )
+                self.assertEqual(locked_detect.status_code, 409)
+                locked_prelabel = client.post(
+                    f"/api/images/{image_id}/prelabel",
+                    json={"block_ids": None, "replace_existing": True},
+                )
+                self.assertEqual(locked_prelabel.status_code, 409)
+                reopened = client.post(f"/api/images/{image_id}/draft")
+                self.assertEqual(reopened.status_code, 200)
+                self.assertEqual(reopened.json()["status"], "draft")
+                edited_payload = reopened.json()
+                edited_payload["blocks"][0]["text"] = "updated"
                 edited = client.put(
                     f"/api/images/{image_id}/annotation", json=edited_payload
                 )
                 self.assertEqual(edited.status_code, 200)
-                self.assertEqual(edited.json()["status"], "edited")
+                self.assertEqual(edited.json()["blocks"][0]["text"], "updated")
+
+    def test_batch_skips_completed_annotations(self):
+        coordinator = Mock()
+        manager = BatchManager(coordinator)
+        catalog = Mock()
+        catalog.list_images.return_value = [Mock(name="done.png", error=None)]
+        store = Mock()
+        store.load.return_value = Annotation(
+            image=image_info(),
+            status="completed",
+            blocks=[
+                Block(
+                    order=0,
+                    polygon=[(1, 1), (10, 1), (10, 8), (1, 8)],
+                    layout_label="text",
+                    task="ocr",
+                    text="done",
+                )
+            ],
+        )
+
+        manager.start("detect", catalog, store)
+        for _ in range(100):
+            if manager.snapshot().state == "completed":
+                break
+            time.sleep(0.005)
+
+        snapshot = manager.snapshot()
+        self.assertEqual(snapshot.state, "completed")
+        self.assertEqual(snapshot.skipped, 1)
+        coordinator.detect.assert_not_called()
+        store.save.assert_not_called()
 
     def test_static_ui_exposes_layout_and_atomic_exports(self):
         html = Path("vl_layout_labeler/static/index.html").read_text(encoding="utf-8")

@@ -68,3 +68,41 @@ def test_layout_inspector_keeps_image_endpoint_and_codec_contracts_unchanged():
     assert 'id="layout-only-note"' in html
     assert "annotation" not in inspector_script
     assert "fetch(" not in inspector_script
+
+
+def test_bbox_interactions_use_incremental_animation_frames_and_draw_preview():
+    script = Path("vl_layout_labeler/static/app.mjs").read_text(encoding="utf-8")
+    stylesheet = Path("vl_layout_labeler/static/styles.css").read_text(
+        encoding="utf-8"
+    )
+
+    pointermove_handler = script.split(
+        'window.addEventListener("pointermove", (event) => {', 1
+    )[1].split("});", 1)[0]
+
+    assert "scheduleDragFrame(eventPoint(event))" in pointermove_handler
+    assert "render();" not in pointermove_handler
+    assert "requestAnimationFrame(flushDragFrame)" in script
+    assert "const activeBlock = blockById(block.id);" in script
+    assert 'preview.classList.add("bbox", "draw-preview")' in script
+    assert 'window.addEventListener("pointermove", move)' in script
+    assert ".bbox.draw-preview" in stylesheet
+
+
+def test_processing_and_completed_states_are_explicit_and_lock_editing():
+    html = Path("vl_layout_labeler/static/index.html").read_text(encoding="utf-8")
+    script = Path("vl_layout_labeler/static/app.mjs").read_text(encoding="utf-8")
+    stylesheet = Path("vl_layout_labeler/static/styles.css").read_text(
+        encoding="utf-8"
+    )
+
+    for element_id in ("operation-status", "completed-banner", "reopen-current"):
+        assert f'id="{element_id}"' in html
+    assert 'role="status"' in html
+    assert 'aria-live="polite"' in html
+    assert 'runCurrent("draft")' in script
+    assert 'state.current?.status === "completed"' in script
+    assert 'classList.add("completed")' in script
+    assert 'setBusy(action)' in script
+    assert ".status.completed" in stylesheet
+    assert ".completed-banner" in stylesheet

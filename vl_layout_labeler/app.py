@@ -130,6 +130,13 @@ def create_app(settings, layout_engine=None, vl_client=None, initial_workspace=N
     app.state.labeler = state
     app.mount("/static", StaticFiles(directory=static_dir), name="static")
 
+    def require_editable(annotation: Annotation) -> None:
+        if annotation.status == "completed":
+            raise HTTPException(
+                status_code=409,
+                detail="completed annotation is read-only; reopen it as draft first",
+            )
+
     @app.get("/", include_in_schema=False)
     def index():
         return FileResponse(static_dir / "index.html")
@@ -223,25 +230,13 @@ def create_app(settings, layout_engine=None, vl_client=None, initial_workspace=N
         workspace = state.require_workspace()
         record = workspace.catalog.get(image_id)
         current = workspace.store.load(record)
+        require_editable(current)
         try:
             annotation = Annotation.model_validate(payload)
-        except ValidationError as original_error:
-            if current.status != "completed" or payload.get("status") != "completed":
-                raise HTTPException(
-                    status_code=422, detail=str(original_error.errors()[0]["msg"])
-                ) from original_error
-            try:
-                annotation = Annotation.model_validate({**payload, "status": "edited"})
-            except ValidationError as edited_error:
-                raise HTTPException(
-                    status_code=422, detail=str(edited_error.errors()[0]["msg"])
-                ) from edited_error
-        if (
-            current.status == "completed"
-            and annotation.status == "completed"
-            and (annotation.image != current.image or annotation.blocks != current.blocks)
-        ):
-            annotation = annotation.model_copy(update={"status": "edited"})
+        except ValidationError as exc:
+            raise HTTPException(
+                status_code=422, detail=str(exc.errors()[0]["msg"])
+            ) from exc
         return workspace.store.save(record, annotation)
 
     @app.post("/api/images/{image_id}/detect")
@@ -249,6 +244,7 @@ def create_app(settings, layout_engine=None, vl_client=None, initial_workspace=N
         workspace = state.require_workspace()
         record = workspace.catalog.get(image_id)
         existing = workspace.store.load(record)
+        require_editable(existing)
         if existing.blocks and not request.replace_existing:
             raise HTTPException(status_code=409, detail="annotation already contains blocks; confirm replacement")
         detected = state.coordinator.detect(record).model_copy(update={"revision": existing.revision})
@@ -259,6 +255,7 @@ def create_app(settings, layout_engine=None, vl_client=None, initial_workspace=N
         workspace = state.require_workspace()
         record = workspace.catalog.get(image_id)
         existing = workspace.store.load(record)
+        require_editable(existing)
         if not existing.blocks:
             raise HTTPException(status_code=409, detail="detect layout before prelabeling")
         try:
@@ -287,6 +284,17 @@ def create_app(settings, layout_engine=None, vl_client=None, initial_workspace=N
                 detail=str(exc.errors()[0]["msg"]),
             ) from exc
         return workspace.store.save(record, annotation)
+
+    @app.post("/api/images/{image_id}/draft")
+    def reopen_image_as_draft(image_id: str):
+        workspace = state.require_workspace()
+        record = workspace.catalog.get(image_id)
+        current = workspace.store.load(record)
+        if current.status != "completed":
+            return current
+        return workspace.store.save(
+            record, current.model_copy(update={"status": "draft"})
+        )
 
     @app.post("/api/batch/{operation}")
     def start_batch(operation: str):

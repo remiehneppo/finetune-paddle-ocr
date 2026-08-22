@@ -112,8 +112,11 @@ class BatchManager:
             try:
                 if record.error:
                     raise ValueError(record.error)
+                existing = store.load(record)
+                if existing.status == "completed":
+                    self._increment("skipped")
+                    continue
                 if operation == "detect":
-                    existing = store.load(record)
                     if existing.blocks:
                         self._increment("skipped")
                         continue
@@ -121,7 +124,6 @@ class BatchManager:
                         update={"revision": existing.revision}
                     )
                 else:
-                    existing = store.load(record)
                     active_blocks = [
                         block
                         for block in existing.blocks

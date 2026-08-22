@@ -24,7 +24,9 @@
       <ol id="image-list"></ol>
     </aside>
     <section class="canvas-panel">
-      <div class="canvas-toolbar"><span id="current-name">Chọn ảnh</span><button id="detect-current">Detect ảnh</button><button id="prelabel-page">Prelabel ảnh</button><button id="prelabel-current">Prelabel chọn</button><button id="add-mode">Thêm bbox</button><button id="complete-current">Complete</button></div>
+      <div class="canvas-toolbar"><span id="current-name">Chọn ảnh</span><button id="detect-current">Detect ảnh</button><button id="prelabel-page">Prelabel ảnh</button><button id="prelabel-current">Prelabel chọn</button><button id="add-mode">Thêm bbox</button><button id="complete-current">Complete</button><button id="reopen-current" class="secondary" hidden>Mở lại chỉnh sửa</button></div>
+      <div id="operation-status" class="operation-status" role="status" aria-live="polite" hidden><span class="spinner" aria-hidden="true"></span><span id="operation-message">Model đang xử lý…</span></div>
+      <div id="completed-banner" class="completed-banner" role="status" aria-live="polite" hidden><strong>✓ Ảnh đã Complete</strong><span>Chỉnh sửa đang bị khóa. Nhấn “Mở lại chỉnh sửa” nếu cần thay đổi output.</span></div>
       <div id="page-stage" tabindex="0"><img id="page-image" alt="Trang tài liệu" /><svg id="overlay"></svg></div>
     </section>
     <div id="inspector-separator" class="pane-separator" role="separator" aria-label="Điều chỉnh chiều rộng inspector" aria-orientation="vertical" aria-valuemin="340" aria-valuemax="760" aria-valuenow="440" tabindex="0"></div>
