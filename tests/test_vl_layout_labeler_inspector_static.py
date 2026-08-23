@@ -106,3 +106,5 @@ def test_processing_and_completed_states_are_explicit_and_lock_editing():
     assert 'setBusy(action)' in script
     assert ".status.completed" in stylesheet
     assert ".completed-banner" in stylesheet
+    toolbar_rule = stylesheet.split(".canvas-toolbar {", 1)[1].split("}", 1)[0]
+    assert "flex-wrap: wrap;" in toolbar_rule

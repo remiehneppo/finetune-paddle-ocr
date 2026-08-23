@@ -5,6 +5,8 @@ from copy import deepcopy
 from dataclasses import asdict, dataclass, field
 from threading import Event, Lock, Thread
 
+from .post_validation import NoEligibleBlocks, OCRPostValidationError
+
 
 @dataclass(frozen=True)
 class BatchError:
@@ -20,8 +22,10 @@ class BatchSnapshot:
     processed: int = 0
     skipped: int = 0
     failed: int = 0
+    validation_failed: int = 0
     current_image: str | None = None
     errors: list[BatchError] = field(default_factory=list)
+    validation_errors: list[BatchError] = field(default_factory=list)
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -75,14 +79,17 @@ class GPUCoordinator:
 
 
 class BatchManager:
-    def __init__(self, coordinator: GPUCoordinator):
+    def __init__(self, coordinator: GPUCoordinator, validation_service=None):
         self.coordinator = coordinator
+        self.validation_service = validation_service
         self._state_lock = Lock()
         self._cancel = Event()
         self._thread: Thread | None = None
         self._snapshot = BatchSnapshot()
 
-    def start(self, operation: str, catalog, store) -> BatchSnapshot:
+    def start(
+        self, operation: str, catalog, store, *, post_validate: bool = False
+    ) -> BatchSnapshot:
         if operation not in {"detect", "prelabel"}:
             raise ValueError("unsupported batch operation")
         with self._state_lock:
@@ -94,12 +101,14 @@ class BatchManager:
                 state="queued", operation=operation, total=len(records)
             )
             self._thread = Thread(
-                target=self._run, args=(operation, records, store), daemon=True
+                target=self._run,
+                args=(operation, records, store, post_validate),
+                daemon=True,
             )
             self._thread.start()
             return deepcopy(self._snapshot)
 
-    def _run(self, operation, records, store) -> None:
+    def _run(self, operation, records, store, post_validate) -> None:
         with self._state_lock:
             self._snapshot.state = "running"
         for record in records:
@@ -135,8 +144,27 @@ class BatchManager:
                     result = self.coordinator.prelabel(
                         record, existing, replace_existing=False
                     )
-                store.save(record, result)
+                saved = store.save(record, result)
                 self._increment("processed")
+                if operation == "prelabel" and post_validate:
+                    try:
+                        if self.validation_service is None:
+                            raise RuntimeError("LLM validation is not configured")
+                        validated = self.validation_service.validate_annotation(saved)
+                        store.save(record, validated)
+                    except NoEligibleBlocks:
+                        pass
+                    except Exception as exc:
+                        message = (
+                            str(exc)
+                            if isinstance(exc, OCRPostValidationError)
+                            else "LLM validation failed"
+                        )
+                        with self._state_lock:
+                            self._snapshot.validation_failed += 1
+                            self._snapshot.validation_errors.append(
+                                BatchError(record.name, message)
+                            )
             except Exception as exc:
                 with self._state_lock:
                     self._snapshot.failed += 1

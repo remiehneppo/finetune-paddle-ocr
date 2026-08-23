@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from hashlib import sha256
 import math
 from datetime import datetime
 from typing import Any, Literal
@@ -12,6 +13,28 @@ Point = tuple[float, float]
 LayoutSource = Literal["layout", "vl", "manual"]
 AnnotationStatus = Literal["draft", "detected", "edited", "completed"]
 Task = Literal["ocr", "table", "formula", "chart"]
+
+
+class ValidationIssue(BaseModel):
+    block_id: UUID
+    start: int = Field(ge=0)
+    end: int = Field(gt=0)
+    category: str = Field(min_length=1)
+    reason: str = Field(min_length=1)
+    suggestion: str = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def validate_span(self) -> ValidationIssue:
+        if self.end <= self.start:
+            raise ValueError("validation issue end must be greater than start")
+        return self
+
+
+class OCRValidation(BaseModel):
+    text_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+    model: str = Field(min_length=1)
+    checked_at: datetime
+    issues: list[ValidationIssue] = Field(default_factory=list)
 
 
 class ImageInfo(BaseModel):
@@ -31,6 +54,19 @@ class Block(BaseModel):
     score: float | None = Field(default=None, ge=0.0, le=1.0)
     source: LayoutSource = "layout"
     skipped: bool = False
+    validation: OCRValidation | None = None
+
+    def current_text_hash(self) -> str:
+        return sha256(self.text.encode("utf-8")).hexdigest()
+
+    @model_validator(mode="after")
+    def invalidate_stale_validation(self) -> Block:
+        if (
+            self.validation is not None
+            and self.validation.text_hash != self.current_text_hash()
+        ):
+            self.validation = None
+        return self
 
     @field_validator("layout_label")
     @classmethod
@@ -127,6 +163,15 @@ class DetectRequest(BaseModel):
 class PrelabelRequest(BaseModel):
     block_ids: list[UUID] | None = None
     replace_existing: bool = True
+    post_validate: bool = False
+
+
+class ValidateRequest(BaseModel):
+    block_ids: list[UUID] | None = None
+
+
+class BatchRequest(BaseModel):
+    post_validate: bool = False
 
 
 class ExportRequest(BaseModel):

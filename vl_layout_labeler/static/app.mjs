@@ -5,6 +5,14 @@ import {
   inspectTarget,
   serializeTarget,
 } from "./target_codec.mjs";
+import {
+  appendValidationPreview,
+  invalidateBlockValidation,
+  loadValidationEnabled,
+  saveValidationEnabled,
+  validationIssueCount,
+  validationSelectionRange,
+} from "./validation_ui.mjs";
 
 const $ = (id) => document.getElementById(id);
 const svg = (name) => document.createElementNS("http://www.w3.org/2000/svg", name);
@@ -12,6 +20,7 @@ const state = {
   images: [], current: null, currentId: null, selected: null,
   view: { scale: 1, x: 0, y: 0 }, add: false, dirty: false, timer: null, drag: null,
   targetMode: "visual", targetError: null, busy: null, batchBusy: null,
+  validationConfigured: false, validationEnabled: false,
 };
 
 async function api(path, options = {}) {
@@ -36,6 +45,7 @@ const IMAGE_STATUS_LABELS = {
 const OPERATION_LABELS = {
   detect: "Model đang detect layout…",
   prelabel: "Model đang prelabel nội dung…",
+  validate: "LLM đang kiểm tra OCR…",
   complete: "Đang hoàn tất ảnh…",
   draft: "Đang mở lại chế độ chỉnh sửa…",
   "batch-detect": "Model đang detect toàn bộ folder…",
@@ -70,6 +80,10 @@ function renderInteractionState() {
   $("prelabel-page").disabled = noCurrent || completed || processing;
   $("prelabel-current").disabled = (
     noCurrent || completed || processing || !block || block.task === null || block.skipped
+  );
+  $("llm-validation").disabled = !state.validationConfigured || processing;
+  $("validate-current").disabled = (
+    noCurrent || completed || processing || !state.validationConfigured
   );
   $("add-mode").disabled = noCurrent || completed || processing;
   $("detect-batch").disabled = processing;
@@ -151,7 +165,9 @@ function renderBlocks() {
     if (block.id === state.selected) item.classList.add("selected");
     const task = block.task || "layout-only";
     const content = block.task ? (block.text || "(chưa có text)") : block.layout_label;
-    item.textContent = `${block.order + 1}. ${task} · ${content}`;
+    item.append(document.createTextNode(`${block.order + 1}. ${task} · ${content}`));
+    const warnings = validationIssueCount(block);
+    if (warnings) item.append(element("span", "validation-badge", String(warnings)));
     item.onclick = () => { state.selected = block.id; state.targetError = null; render(); };
     list.append(item);
   }
@@ -161,6 +177,7 @@ function renderInspector() {
   const block = selectedBlock();
   $("editor").hidden = !block;
   $("prelabel-current").disabled = !block || block.task === null || block.skipped;
+  renderValidationIssues(block);
   if (!block) return;
   $("layout-label").value = block.layout_label;
   $("task").value = block.task || "";
@@ -168,6 +185,50 @@ function renderInspector() {
   $("skipped").checked = block.skipped;
   $("block-meta").textContent = `${block.source}${block.score == null ? "" : ` · ${(block.score * 100).toFixed(1)}%`}`;
   renderTargetEditor();
+}
+
+function renderValidationIssues(block) {
+  const list = $("validation-issues");
+  const empty = $("validation-empty");
+  const meta = $("validation-meta");
+  list.replaceChildren();
+  const validation = block?.validation;
+  empty.hidden = Boolean(validation);
+  meta.textContent = validation
+    ? `${validation.model} · ${new Date(validation.checked_at).toLocaleString()}`
+    : "";
+  if (!validation) return;
+  if (!validation.issues.length) {
+    empty.hidden = false;
+    empty.textContent = "Không có cảnh báo.";
+    return;
+  }
+  empty.textContent = "Chưa chạy validation cho block này.";
+  for (const issue of validation.issues) {
+    const item = element("li", "validation-issue");
+    const button = element("button", "validation-issue-button");
+    button.type = "button";
+    button.append(
+      element("strong", "", issue.category),
+      element("span", "validation-reason", issue.reason),
+      element("span", "validation-suggestion", `Gợi ý: ${issue.suggestion}`),
+    );
+    const preview = element("span", "validation-preview");
+    appendValidationPreview(document, preview, block.text, issue);
+    button.append(preview);
+    button.onclick = () => {
+      state.selected = issue.block_id;
+      state.targetMode = "raw";
+      state.targetError = null;
+      render();
+      const editor = $("text");
+      editor.focus();
+      const range = validationSelectionRange(block.text, issue);
+      if (range) editor.setSelectionRange(range.start, range.end);
+    };
+    item.append(button);
+    list.append(item);
+  }
 }
 
 function setTargetMessage(inspection) {
@@ -186,8 +247,10 @@ function targetButton(label, callback, className = "secondary") {
 
 function markBlockEdited(block) {
   if (editingLocked()) return;
+  invalidateBlockValidation(block);
   markManual(block);
   renderBlocks();
+  renderValidationIssues(block);
   markDirty();
 }
 
@@ -648,11 +711,17 @@ async function runCurrent(action, body) {
     const options = { method: "POST" };
     if (body !== undefined) options.body = JSON.stringify(body);
     const selectedId = state.selected;
-    state.current = await api(`/api/images/${state.currentId}/${action}`, options);
+    const payload = await api(`/api/images/${state.currentId}/${action}`, options);
+    const validationError = payload.validation_error;
+    state.current = payload.annotation || payload;
     state.selected = blockById(selectedId)?.id || state.current.blocks[0]?.id || null;
     render();
     await loadImages();
-    setStatus(action === "draft" ? "Đã mở lại chế độ chỉnh sửa" : "Hoàn tất");
+    setStatus(
+      validationError
+        ? `Prelabel đã lưu; validation lỗi: ${validationError}`
+        : action === "draft" ? "Đã mở lại chế độ chỉnh sửa" : "Hoàn tất"
+    );
   } catch (error) {
     setStatus(`Lỗi: ${error.message}`);
   } finally {
@@ -811,7 +880,12 @@ async function startBatch(operation) {
   if (currentOperation()) return;
   setBatchBusy(`batch-${operation}`);
   try {
-    await pollBatch(await api(`/api/batch/${operation}`, { method: "POST" }));
+    await pollBatch(await api(`/api/batch/${operation}`, {
+      method: "POST",
+      body: JSON.stringify({
+        post_validate: operation === "prelabel" && state.validationEnabled,
+      }),
+    }));
   } catch (error) {
     setBatchBusy(null);
     setStatus(`Lỗi batch: ${error.message}`);
@@ -820,7 +894,10 @@ async function startBatch(operation) {
 async function pollBatch(snapshot) {
   $("batch-progress").max = snapshot.total || 1;
   $("batch-progress").value = snapshot.processed + snapshot.skipped + snapshot.failed;
-  $("batch-status").textContent = `${snapshot.state}: ${snapshot.processed}/${snapshot.total}`;
+  const validationFailures = snapshot.validation_failed
+    ? ` · validation lỗi: ${snapshot.validation_failed}`
+    : "";
+  $("batch-status").textContent = `${snapshot.state}: ${snapshot.processed}/${snapshot.total}${validationFailures}`;
   if (["queued", "running", "cancelling"].includes(snapshot.state)) {
     setTimeout(async () => {
       try {
@@ -858,8 +935,19 @@ $("open-folder").onclick = async () => {
   } catch (error) { setStatus(`Lỗi: ${error.message}`); }
 };
 $("detect-current").onclick = () => runCurrent("detect", { replace_existing: true });
-$("prelabel-page").onclick = () => runCurrent("prelabel", { block_ids: null, replace_existing: true });
-$("prelabel-current").onclick = () => runCurrent("prelabel", { block_ids: state.selected ? [state.selected] : null, replace_existing: true });
+$("prelabel-page").onclick = () => runCurrent("prelabel", {
+  block_ids: null, replace_existing: true, post_validate: state.validationEnabled,
+});
+$("prelabel-current").onclick = () => runCurrent("prelabel", {
+  block_ids: state.selected ? [state.selected] : null,
+  replace_existing: true,
+  post_validate: state.validationEnabled,
+});
+$("validate-current").onclick = () => runCurrent("validate", { block_ids: null });
+$("llm-validation").onchange = (event) => {
+  state.validationEnabled = event.target.checked;
+  saveValidationEnabled(window.localStorage, state.validationEnabled);
+};
 $("complete-current").onclick = async () => {
   const invalid = state.current?.blocks.find((block) => (
     !block.skipped && block.task !== null && !inspectTarget(block.task, block.text).valid
@@ -930,7 +1018,15 @@ $("export-layout").onclick = () => exportDataset("/api/export/layout", "Layout e
 $("export-all").onclick = () => exportDataset("/api/export/all", "Export All");
 window.addEventListener("resize", fitImage);
 
-const taxonomy = await api("/api/taxonomy");
+const [taxonomy, health] = await Promise.all([api("/api/taxonomy"), api("/api/health")]);
+state.validationConfigured = Boolean(health.post_validation?.configured);
+state.validationEnabled = loadValidationEnabled(
+  window.localStorage, state.validationConfigured,
+);
+$("llm-validation").checked = state.validationEnabled;
+$("llm-validation").title = state.validationConfigured
+  ? `Model: ${health.post_validation.model}`
+  : "Backend chưa cấu hình LLM validation";
 for (const label of taxonomy.layout_labels) {
   const option = document.createElement("option");
   option.value = label;

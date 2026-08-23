@@ -221,6 +221,19 @@ class AnnotationStore:
                 raise RevisionConflict(
                     f"expected revision {current_revision}, got {annotation.revision}"
                 )
+            annotation = annotation.model_copy(
+                update={
+                    "blocks": [
+                        block.model_copy(update={"validation": None})
+                        if (
+                            block.validation is not None
+                            and block.validation.text_hash != block.current_text_hash()
+                        )
+                        else block
+                        for block in annotation.blocks
+                    ]
+                }
+            )
             if (
                 current is not None
                 and current.status == "completed"

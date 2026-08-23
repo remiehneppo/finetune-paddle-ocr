@@ -17,7 +17,20 @@ from pydantic import BaseModel, ValidationError
 from .batch import BatchManager, GPUCoordinator
 from .catalog import UnknownImageError, WorkspaceCatalog
 from .layout_engine import LayoutDetectionEngine
-from .models import Annotation, DetectRequest, ExportRequest, PrelabelRequest
+from .models import (
+    Annotation,
+    BatchRequest,
+    DetectRequest,
+    ExportRequest,
+    PrelabelRequest,
+    ValidateRequest,
+)
+from .post_validation import (
+    NoEligibleBlocks,
+    OCRPostValidationError,
+    OpenAICompatiblePostValidator,
+    ValidationService,
+)
 from .storage import (
     AnnotationStore,
     ExportError,
@@ -81,10 +94,11 @@ def _open_image(catalog: WorkspaceCatalog, record):
 
 
 class AppState:
-    def __init__(self, settings, layout_engine, vl_client):
+    def __init__(self, settings, layout_engine, vl_client, validation_service):
         self.settings = settings
         self.coordinator = GPUCoordinator(layout_engine, vl_client)
-        self.batch = BatchManager(self.coordinator)
+        self.validation_service = validation_service
+        self.batch = BatchManager(self.coordinator, validation_service)
         self._workspace: Workspace | None = None
         self.lock = Lock()
 
@@ -101,14 +115,27 @@ class AppState:
         )
 
 
-def create_app(settings, layout_engine=None, vl_client=None, initial_workspace=None) -> FastAPI:
+def create_app(
+    settings,
+    layout_engine=None,
+    vl_client=None,
+    initial_workspace=None,
+    post_validator=None,
+) -> FastAPI:
     owns_layout = layout_engine is None
     owns_vl = vl_client is None
     active_layout = layout_engine or LayoutDetectionEngine.create(settings)
     active_vl = vl_client or VLClient(settings)
     if owns_vl:
         active_vl.check_ready()
-    state = AppState(settings, active_layout, active_vl)
+    owns_validator = post_validator is None and settings.validation_configured
+    active_validator = post_validator
+    if active_validator is None and settings.validation_configured:
+        active_validator = OpenAICompatiblePostValidator.from_settings(settings)
+    validation_service = (
+        ValidationService(active_validator) if active_validator is not None else None
+    )
+    state = AppState(settings, active_layout, active_vl, validation_service)
     static_dir = Path(__file__).with_name("static")
 
     @asynccontextmanager
@@ -125,6 +152,8 @@ def create_app(settings, layout_engine=None, vl_client=None, initial_workspace=N
                 active_layout.close()
             if owns_vl:
                 active_vl.close()
+            if owns_validator:
+                validation_service.close()
 
     app = FastAPI(title="PaddleOCR-VL Layout Labeler", lifespan=lifespan)
     app.state.labeler = state
@@ -161,6 +190,10 @@ def create_app(settings, layout_engine=None, vl_client=None, initial_workspace=N
     async def export_handler(request, exc):
         return JSONResponse(status_code=422, content={"detail": str(exc)})
 
+    @app.exception_handler(OCRPostValidationError)
+    async def post_validation_handler(request, exc):
+        return JSONResponse(status_code=502, content={"detail": str(exc)})
+
     @app.get("/api/health")
     def health():
         workspace = state._workspace
@@ -171,6 +204,10 @@ def create_app(settings, layout_engine=None, vl_client=None, initial_workspace=N
             "layout_model": str(settings.layout_model_dir),
             "vl_base_url": settings.vl_base_url,
             "vl_model": settings.vl_model,
+            "post_validation": {
+                "configured": validation_service is not None,
+                "model": validation_service.model if validation_service else None,
+            },
         }
 
     @app.get("/api/taxonomy")
@@ -267,7 +304,40 @@ def create_app(settings, layout_engine=None, vl_client=None, initial_workspace=N
             )
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
-        return workspace.store.save(record, updated)
+        saved = workspace.store.save(record, updated)
+        if not request.post_validate:
+            return saved
+        validation_error = None
+        if validation_service is None:
+            validation_error = "LLM validation is not configured"
+        else:
+            try:
+                saved = workspace.store.save(
+                    record, validation_service.validate_annotation(saved, request.block_ids)
+                )
+            except NoEligibleBlocks:
+                pass
+            except (OCRPostValidationError, RevisionConflict) as exc:
+                validation_error = str(exc)
+            except Exception:
+                validation_error = "LLM validation failed"
+        return {"annotation": saved, "validation_error": validation_error}
+
+    @app.post("/api/images/{image_id}/validate")
+    def validate_image(image_id: str, request: ValidateRequest | None = None):
+        workspace = state.require_workspace()
+        record = workspace.catalog.get(image_id)
+        existing = workspace.store.load(record)
+        require_editable(existing)
+        if validation_service is None:
+            raise HTTPException(status_code=503, detail="LLM validation is not configured")
+        try:
+            validated = validation_service.validate_annotation(
+                existing, request.block_ids if request else None
+            )
+        except (NoEligibleBlocks, ValueError) as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        return workspace.store.save(record, validated)
 
     @app.post("/api/images/{image_id}/complete")
     def complete_image(image_id: str):
@@ -297,10 +367,15 @@ def create_app(settings, layout_engine=None, vl_client=None, initial_workspace=N
         )
 
     @app.post("/api/batch/{operation}")
-    def start_batch(operation: str):
+    def start_batch(operation: str, request: BatchRequest | None = None):
         workspace = state.require_workspace()
         try:
-            return state.batch.start(operation, workspace.catalog, workspace.store).to_dict()
+            return state.batch.start(
+                operation,
+                workspace.catalog,
+                workspace.store,
+                post_validate=bool(request and request.post_validate),
+            ).to_dict()
         except (RuntimeError, ValueError) as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
 

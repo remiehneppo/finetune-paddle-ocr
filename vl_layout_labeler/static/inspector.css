@@ -597,3 +597,72 @@ body.editor-focus-open {
 .table-cell-actions {
   margin-left: auto;
 }
+.validation-panel {
+  border-top: 1px solid #dbe2ea;
+  margin-top: 16px;
+  padding-top: 12px;
+}
+
+.validation-heading {
+  align-items: baseline;
+  display: flex;
+  gap: 8px;
+  justify-content: space-between;
+}
+
+.validation-panel ol {
+  display: grid;
+  gap: 8px;
+  list-style: none;
+  margin: 8px 0 0;
+  padding: 0;
+}
+
+.validation-issue-button {
+  display: grid;
+  gap: 5px;
+  text-align: left;
+  width: 100%;
+}
+
+.validation-reason,
+.validation-suggestion,
+.validation-preview {
+  display: block;
+  white-space: pre-wrap;
+}
+
+.validation-preview {
+  background: #fff8db;
+  border-radius: 4px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  max-height: 7em;
+  overflow: auto;
+  padding: 6px;
+}
+
+.validation-preview mark {
+  background: #ffd166;
+  color: #241b00;
+}
+
+.validation-badge {
+  background: #b45309;
+  border-radius: 999px;
+  color: white;
+  font-size: 0.75rem;
+  margin-left: 8px;
+  padding: 1px 7px;
+}
+
+.validation-toggle {
+  align-items: center;
+  display: inline-flex;
+  gap: 5px;
+  white-space: nowrap;
+}
+
+.validation-toggle input {
+  margin: 0;
+  width: auto;
+}

@@ -24,7 +24,7 @@
       <ol id="image-list"></ol>
     </aside>
     <section class="canvas-panel">
-      <div class="canvas-toolbar"><span id="current-name">Chọn ảnh</span><button id="detect-current">Detect ảnh</button><button id="prelabel-page">Prelabel ảnh</button><button id="prelabel-current">Prelabel chọn</button><button id="add-mode">Thêm bbox</button><button id="complete-current">Complete</button><button id="reopen-current" class="secondary" hidden>Mở lại chỉnh sửa</button></div>
+      <div class="canvas-toolbar"><span id="current-name">Chọn ảnh</span><button id="detect-current">Detect ảnh</button><button id="prelabel-page">Prelabel ảnh</button><button id="prelabel-current">Prelabel chọn</button><label class="validation-toggle"><input id="llm-validation" type="checkbox" /> LLM validation</label><button id="validate-current" class="secondary">Chạy lại validation</button><button id="add-mode">Thêm bbox</button><button id="complete-current">Complete</button><button id="reopen-current" class="secondary" hidden>Mở lại chỉnh sửa</button></div>
       <div id="operation-status" class="operation-status" role="status" aria-live="polite" hidden><span class="spinner" aria-hidden="true"></span><span id="operation-message">Model đang xử lý…</span></div>
       <div id="completed-banner" class="completed-banner" role="status" aria-live="polite" hidden><strong>✓ Ảnh đã Complete</strong><span>Chỉnh sửa đang bị khóa. Nhấn “Mở lại chỉnh sửa” nếu cần thay đổi output.</span></div>
       <div id="page-stage" tabindex="0"><img id="page-image" alt="Trang tài liệu" /><svg id="overlay"></svg></div>
@@ -75,6 +75,11 @@
                 <label>Raw output<textarea id="text" spellcheck="false"></textarea></label>
                 <p class="muted">Raw luôn được giữ nguyên khi chưa thể ánh xạ sang giao diện trực quan.</p>
               </div>
+            </section>
+            <section id="validation-panel" class="validation-panel" aria-labelledby="validation-title">
+              <div class="validation-heading"><strong id="validation-title">Cảnh báo LLM</strong><span id="validation-meta" class="muted"></span></div>
+              <div id="validation-empty" class="muted">Chưa chạy validation cho block này.</div>
+              <ol id="validation-issues"></ol>
             </section>
             <details class="block-options">
               <summary>Tùy chọn block</summary>

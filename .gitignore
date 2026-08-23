@@ -6,6 +6,7 @@ runs/
 .pytest_cache/
 .codegraph/
 .superpowers/
+.context/
 PaddleOCR/
 models/*.pdparams
 models/*.part

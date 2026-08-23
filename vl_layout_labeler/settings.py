@@ -14,9 +14,21 @@ class LabelerSettings:
     vl_api_key: str | None = None
     vl_timeout: float = 120.0
     vl_max_tokens: int = 4096
+    validation_base_url: str | None = None
+    validation_model: str | None = None
+    validation_api_key: str | None = None
+    validation_timeout: float = 30.0
+    validation_max_tokens: int = 2048
     host: str = "127.0.0.1"
     port: int = 8012
     data_dir_name: str = ".paddleocr-vl-labeler"
+
+    @property
+    def validation_configured(self) -> bool:
+        return bool(
+            (self.validation_base_url or "").strip()
+            and (self.validation_model or "").strip()
+        )
 
     def validate(self, *, require_runtime_models: bool = True) -> LabelerSettings:
         if self.host != "localhost":
@@ -35,6 +47,14 @@ class LabelerSettings:
             raise ValueError("vl_model must not be empty")
         if self.vl_timeout <= 0 or self.vl_max_tokens <= 0:
             raise ValueError("VL timeout and max tokens must be positive")
+        has_validation_url = bool((self.validation_base_url or "").strip())
+        has_validation_model = bool((self.validation_model or "").strip())
+        if has_validation_url != has_validation_model:
+            raise ValueError(
+                "validation_base_url and validation_model must be configured together"
+            )
+        if self.validation_timeout <= 0 or self.validation_max_tokens <= 0:
+            raise ValueError("validation timeout and max tokens must be positive")
         if require_runtime_models:
             model_dir = self.layout_model_dir.expanduser().resolve()
             required = {"inference.json", "inference.pdiparams", "inference.yml"}
