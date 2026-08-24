@@ -63,3 +63,99 @@ Các lý do loại dữ liệu được thống kê trong `summary.json` và ghi
 dòng/box trong `rejected.jsonl`. Transcription không dùng cho bài toán detection:
 box thường được canonical hóa thành `text`, còn box ignore giữ `###` đúng contract
 `DetLabelEncode` của PaddleOCR.
+
+## Quy trình chạy đầy đủ
+
+### 1. Cài môi trường và weight
+
+Dùng virtualenv PP-OCRv6 ở root repository, không dùng môi trường ERNIEKit VL:
+
+```bash
+source .venv/bin/activate
+python -m pip install -r PaddleOCR/requirements.txt
+python -m pip install -r requirements.txt
+./download_pretrained_models.sh det
+python -c "import paddle; paddle.utils.run_check()"
+```
+
+### 2. Validate và stage dataset
+
+```bash
+python finetune_det.py \
+  --dataset-dir /data/pages_a /data/pages_b \
+  --paddleocr-dir ./PaddleOCR \
+  --work-dir /media/tieubaoca/HDD1/F/finetune-output/det_prepare \
+  --validation-ratio 0.10 \
+  --seed 2026 \
+  --prepare-only
+```
+
+Đọc `prepared/summary.json` và `prepared/rejected.jsonl`. Chỉ train khi cả
+`train.txt` và `validation.txt` có sample hợp lệ, split không bị duplicate hash
+và rejection đã được hiểu rõ.
+
+### 3. Train và export
+
+```bash
+python finetune_det.py \
+  --dataset-dir /data/pages_a /data/pages_b \
+  --paddleocr-dir ./PaddleOCR \
+  --work-dir /media/tieubaoca/HDD1/F/finetune-output/det_v1 \
+  --pretrained-model ./models/PP-OCRv6_medium_det_pretrained.pdparams \
+  --epochs 100 \
+  --learning-rate 1e-4 \
+  --batch-size 4 \
+  --num-workers 4 \
+  --eval-batch-step 200 \
+  --save-epoch-step 5 \
+  --export-after-train
+```
+
+Nếu OOM, giảm `--batch-size` xuống `3`, sau đó `2`. Chỉ dùng `--disable-amp`
+khi AMP/runtime gây lỗi; tắt AMP thường làm tăng VRAM.
+
+## Tham số `finetune_det.py`
+
+| Argument | Bắt buộc/default | Ý nghĩa |
+| --- | --- | --- |
+| `--dataset-dir PATH [PATH ...]` | Bắt buộc | Một hoặc nhiều workspace, `.paddleocr-det-labeler` hoặc `det_labels.txt`. |
+| `--paddleocr-dir PATH` | `./PaddleOCR` | Checkout PaddleOCR chứa `tools/train.py`. |
+| `--work-dir PATH` | `runs/vi_det_YYYYmmdd_HHMMSS` | Run mới; script từ chối thư mục đã có nội dung. |
+| `--config VALUE` | `configs/det/PP-OCRv6/PP-OCRv6_medium_det.yml` | Config relative với checkout hoặc absolute path. Architecture/loss/transform chain phải giữ nguyên. |
+| `--pretrained-model VALUE` | URL official medium det | URL hoặc file training `.pdparams`. Inference directory và suffix khác bị từ chối. |
+| `--validation-ratio FLOAT` | `0.10` | Tỷ lệ validation, trong `(0, 0.5)`. Split theo source sau deduplicate SHA-256. |
+| `--seed INT` | `2026` | Seed split và shuffle. |
+| `--epochs INT` | `100` | Số epoch trong config resolved. |
+| `--learning-rate FLOAT` | `1e-4` | Learning rate ban đầu. |
+| `--batch-size INT` | `4` | Batch train mỗi card. |
+| `--num-workers INT` | `4` | Data loader workers. |
+| `--eval-batch-step INT` | `200` | Chu kỳ validation theo training step. |
+| `--save-epoch-step INT` | `5` | Chu kỳ lưu checkpoint theo epoch. |
+| `--max-image-pixels INT` | `50_000_000` | Ảnh lớn hơn giới hạn bị reject trước staging. |
+| `--min-polygon-area FLOAT` | `4.0` | Polygon nhỏ hơn diện tích này bị reject. |
+| `--disable-amp` | Tắt | Tắt mixed precision; mặc định AMP bật. |
+| `--prepare-only` | Tắt | Chỉ validate, stage và ghi config; không chạy GPU/train. |
+| `--export-after-train` | Tắt | Export best checkpoint sang `inference/best_accuracy/`. |
+
+## Failure gates
+
+- `--validation-ratio` phải trong `(0, 0.5)`; các count/rate phải dương.
+- `--paddleocr-dir` phải có `tools/train.py`; config phải tồn tại.
+- Label path không được thoát workspace; JSON, points, polygon và ảnh phải hợp lệ.
+- Pretrained phải là `.pdparams` và khớp shape toàn bộ PP-OCRv6 detector.
+- Script giữ nguyên `Architecture`, `Loss` và tên/thứ tự transform của config gốc.
+- Nếu GradScaler không tương thích NumPy, cài dependency đã pin (`numpy<2.4`).
+- `--export-after-train` fail nếu training không tạo best checkpoint.
+
+## Artifact cần bàn giao
+
+```text
+<work-dir>/prepared/summary.json
+<work-dir>/prepared/rejected.jsonl
+<work-dir>/resolved_config.yml
+<work-dir>/output/
+<work-dir>/inference/best_accuracy/   # nếu export
+```
+
+Ghi kèm command, git SHA, pretrained path/hash, dataset manifest/hash, peak VRAM,
+best Hmean/precision/recall và inference path.

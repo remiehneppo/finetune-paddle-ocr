@@ -312,3 +312,197 @@ PYTHONPATH=. pytest -q tests/test_finetune_vl.py tests/test_finetune.py
 PYTHONPATH=. pytest -q tests/test_finetune_vl_layout.py
 bash -n download_pretrained_models.sh
 ```
+
+## Recipe labeler-only: prepare → inspect → smoke → pilot
+
+Ví dụ dưới đây chỉ dùng dataset do VL Layout Labeler tạo, không trộn các bộ OCR
+lớn. Dataset export cần có `train`/`validation` và row-level task metadata.
+
+```bash
+export REPO=/home/tieubaoca/AI/ocr/paddle-ocr
+export OUTPUT_ROOT=/media/tieubaoca/HDD1/F/finetune-output
+export VL_MODEL=/home/tieubaoca/AI/models/paddleocr-cache/official_models/PaddleOCR-VL-1.6
+export ERNIEKIT_DIR=$OUTPUT_ROOT/vl16_vi_experiment/runtime/erniekit
+export LABELER_EXPORT=$OUTPUT_ROOT/vl_layout_experiment/export/vl
+export PREPARED=$OUTPUT_ROOT/vl_layout_experiment/vl_labeler_prepare
+cd "$REPO"
+```
+
+### 1. Prepare lại sau mỗi lần Export All thay đổi
+
+```bash
+python finetune_vl.py \
+  --dataset-dir "$LABELER_EXPORT" \
+  --model "$VL_MODEL" \
+  --work-dir "$PREPARED" \
+  --prepare-only
+```
+
+Không cần prepare lại nếu export/manifest không đổi. Không xóa hoặc di chuyển
+`$PREPARED` khi run train vẫn dùng `--prepared-from`.
+
+### 2. Inspect decoder-only LoRA
+
+```bash
+CUDA_VISIBLE_DEVICES=0 \
+$ERNIEKIT_DIR/.venv/bin/python finetune_vl.py \
+  --prepared-from "$PREPARED" \
+  --erniekit-dir "$ERNIEKIT_DIR" \
+  --model "$VL_MODEL" \
+  --work-dir "$OUTPUT_ROOT/vl16_vi_experiment/labeler_only_inspect" \
+  --inspect-model \
+  --gradient-accumulation-steps 16 \
+  --eval-samples-per-dataset 4 \
+  --devices 0
+```
+
+Kiểm tra `metrics/trainable_parameters.json`; adapter không được có tensor
+vision và vision encoder phải frozen.
+
+### 3. Smoke ba bước
+
+```bash
+CUDA_VISIBLE_DEVICES=0 \
+$ERNIEKIT_DIR/.venv/bin/python finetune_vl.py \
+  --prepared-from "$PREPARED" \
+  --erniekit-dir "$ERNIEKIT_DIR" \
+  --model "$VL_MODEL" \
+  --work-dir "$OUTPUT_ROOT/vl16_vi_experiment/labeler_only_smoke" \
+  --smoke-steps 3 \
+  --gradient-accumulation-steps 16 \
+  --eval-samples-per-dataset 4 \
+  --max-pixels 250880 \
+  --max-seq-len 4096 \
+  --devices 0
+```
+
+Nếu FlashAttention lỗi, thêm `--no-flash-attention`. Không thay LoRA scope hoặc
+mở vision training để chữa OOM.
+
+### 4. Pilot 30 epoch
+
+```bash
+CUDA_VISIBLE_DEVICES=0 \
+$ERNIEKIT_DIR/.venv/bin/python finetune_vl.py \
+  --prepared-from "$PREPARED" \
+  --erniekit-dir "$ERNIEKIT_DIR" \
+  --model "$VL_MODEL" \
+  --work-dir "$OUTPUT_ROOT/vl16_vi_experiment/labeler_only_pilot" \
+  --epochs 30 \
+  --learning-rate 1e-4 \
+  --lora-rank 32 \
+  --gradient-accumulation-steps 16 \
+  --save-steps 10 \
+  --eval-samples-per-dataset 4 \
+  --eval-max-checkpoints 3 \
+  --max-pixels 250880 \
+  --max-seq-len 4096 \
+  --devices 0
+```
+
+Đây là overfit/feasibility pilot. Nếu validation chỉ có một table crop và không
+có OCR crop, evaluator chỉ chứng minh pipeline hoạt động; không đủ để kết luận
+model tốt hơn base.
+
+## Tham số `finetune_vl.py`
+
+| Argument | Bắt buộc/default | Ý nghĩa |
+| --- | --- | --- |
+| `--task {ocr,table,formula,chart}` | `ocr` | Task mặc định cho row thiếu cột `task`. Row-level task luôn được ưu tiên. |
+| `--dataset-dir PATH [PATH ...]` | Một trong hai với `--prepared-from` | Raw dataset source; hỗ trợ nhiều source. |
+| `--dataset-task TASK [TASK ...]` | Không có | Task mặc định cho từng source, cùng số lượng/thứ tự `--dataset-dir`. |
+| `--prepared-from PATH` | Một trong hai với `--dataset-dir` | Dùng lại JSONL/ảnh của run prepare; cấm với prepare-only/resume. |
+| `--erniekit-dir PATH` | Bắt buộc khi không prepare-only | ERNIEKit release/v1.5 checkout đã pin và có runtime Python. |
+| `--model PATH_OR_ID` | `PaddlePaddle/PaddleOCR-VL-1.6` | Base model; inspect/train yêu cầu local snapshot hợp lệ. |
+| `--work-dir PATH` | Timestamp run | Run output mới; resume dùng đúng run cũ. |
+| `--prepare-only` | Tắt | Chỉ validate/stage; không load model hoặc train. |
+| `--smoke-steps INT` | Không có | Override `max_steps`; phải dương. |
+| `--resume-from PATH` | Không có | Resume checkpoint thuộc `--work-dir`; không dùng với prepared-from. |
+| `--inspect-model` | Tắt | Inspect trainable LoRA rồi dừng. |
+| `--epochs FLOAT` | `3.0` | Số epoch logic dùng tính `max_steps`. |
+| `--learning-rate FLOAT` | `1e-4` | Learning rate LoRA. |
+| `--lora-rank INT` | `32` | Rank LoRA; alpha bằng `2 * rank`. |
+| `--min-pixels INT` | `50176` | Smart-resize lower bound (`64 * 28 * 28`). |
+| `--max-pixels INT` | `451584` | Smart-resize upper bound (`576 * 28 * 28`). |
+| `--max-image-pixels INT` | `50_000_000` | Giới hạn ảnh nguồn. |
+| `--max-seq-len INT` | `2048` | Tổng token budget; sample vượt bị reject, target không truncate. |
+| `--gradient-accumulation-steps INT` | `32` | Micro-batch accumulation; batch/packing mặc định đều bằng 1. |
+| `--validation-ratio FLOAT` | `0.02` | Tách validation cho raw source thiếu split, trong `(0, 0.5)`. |
+| `--num-workers INT` | `2` | Dataloader workers. |
+| `--prefetch-factor INT` | `2` | Prefetch mỗi worker. |
+| `--seed INT` | `2026` | Seed prepare/sampling/training. |
+| `--eval-samples-per-dataset INT` | `32` | Validation row tối đa mỗi source. |
+| `--eval-max-new-tokens INT` | `1024` | Generation limit chung. |
+| `--eval-task-max-new-tokens TASK=INT` | Không có, lặp được | Generation limit theo task. |
+| `--eval-max-checkpoints INT` | `3` | Số checkpoint gần nhất cộng final adapter được chấm. |
+| `--min-normalized-edit-distance FLOAT` | `0.5` | NED threshold trong `[0, 1]`. |
+| `--max-cer FLOAT` | `1.0` | CER threshold không âm. |
+| `--save-steps INT` | `100` | Chu kỳ save theo optimizer step. |
+| `--skip-evaluation` | Tắt | Bỏ native evaluation/checkpoint selection; không dùng để claim quality. |
+| `--devices VALUE` | Env hoặc `0` | CUDA device IDs comma-separated. |
+| `--no-flash-attention` | Tắt | Tắt FlashAttention. |
+
+Các tổ hợp bị cấm:
+
+- `--dataset-dir` cùng `--prepared-from`;
+- `--prepared-from` cùng `--prepare-only`;
+- `--prepared-from` cùng `--resume-from`;
+- `--dataset-task` không có `--dataset-dir` hoặc số task khác số source.
+
+## Chạy evaluator độc lập
+
+```bash
+.venv-vl-eval/bin/python evaluate_paddleocr_vl.py \
+  --base-model "$VL_MODEL" \
+  --merged-model "$OUTPUT_ROOT/vl16_vi_experiment/labeler_only_pilot/adapter/export" \
+  --validation-jsonl "$PREPARED/prepared/validation-source-000.jsonl" \
+  --output-dir "$OUTPUT_ROOT/vl16_vi_experiment/labeler_only_pilot/manual_eval" \
+  --samples-per-dataset 8 \
+  --max-new-tokens 1024 \
+  --task-max-new-tokens table=2048 \
+  --min-normalized-edit-distance 0.5 \
+  --max-cer 1.0
+```
+
+### Tham số `evaluate_paddleocr_vl.py`
+
+| Argument | Bắt buộc/default | Ý nghĩa |
+| --- | --- | --- |
+| `--base-model PATH` | Bắt buộc | Base snapshot. |
+| `--merged-model PATH` | Bắt buộc | Merged HF model. |
+| `--validation-jsonl PATH [PATH ...]` | Bắt buộc | Validation JSONL sources. |
+| `--output-dir PATH` | Bắt buộc | Metrics output. |
+| `--samples-per-dataset INT` | `32` | Row tối đa mỗi source. |
+| `--max-new-tokens INT` | `1024` | Generation limit chung. |
+| `--task-max-new-tokens TASK=INT` | Không có, lặp được | Limit riêng task. |
+| `--min-normalized-edit-distance FLOAT` | `0.5` | NED quality threshold. |
+| `--max-cer FLOAT` | `1.0` | CER quality threshold. |
+| `--base-predictions-jsonl PATH` | Không có | Tái sử dụng base predictions. |
+| `--report-only` | Tắt | Ghi report nhưng không fail exit code; chỉ dùng smoke/screening. |
+
+## Merge adapter độc lập
+
+```bash
+CUDA_VISIBLE_DEVICES=0 \
+$ERNIEKIT_DIR/.venv/bin/python merge_paddleocr_vl_lora.py \
+  --base-model "$VL_MODEL" \
+  --adapter-dir "$OUTPUT_ROOT/vl16_vi_experiment/labeler_only_pilot/adapter" \
+  --output-dir "$OUTPUT_ROOT/vl16_vi_experiment/labeler_only_pilot/manual_merge" \
+  --fixture-jsonl "$PREPARED/prepared/validation-source-000.jsonl" \
+  --min-pixels 50176 \
+  --max-pixels 250880
+```
+
+### Tham số `merge_paddleocr_vl_lora.py`
+
+| Argument | Bắt buộc | Ý nghĩa |
+| --- | --- | --- |
+| `--base-model PATH` | Có | Base snapshot có `model_type=paddleocr_vl`. |
+| `--adapter-dir PATH` | Có | LoRA adapter directory. |
+| `--output-dir PATH` | Có | Output mới ngoài base; không chứa safetensors cũ. |
+| `--fixture-jsonl PATH` | Có | Fixture cho weight/logit verification. |
+| `--min-pixels INT` | Có | Min resize giống train. |
+| `--max-pixels INT` | Có | Max resize giống train. |
+
+Merge thành công phải có `model.safetensors`, `merge_verification.json` và
+`logits_verification.json`, cả hai report có status `passed`.

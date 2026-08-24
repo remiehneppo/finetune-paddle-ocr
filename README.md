@@ -287,3 +287,522 @@ PADDLEX_CONFIG=.venv/lib/python3.12/site-packages/paddlex/configs/modules/layout
   -o Global.dataset_dir=/path/to/export/layout \
   -o Train.num_classes=25
 ```
+
+## Hướng dẫn đầy đủ các script fine-tune
+
+Repository có ba pipeline huấn luyện độc lập. Không dùng lẫn môi trường, model
+weight hoặc format dataset giữa các pipeline:
+
+| Script | Bài toán | Dataset đầu vào | Backend | Artifact chính |
+| --- | --- | --- | --- | --- |
+| `finetune.py` | PP-OCRv6 text recognition trên ảnh crop | Hugging Face `save_to_disk()` hoặc Parquet local | `PaddleOCR/tools/train.py` | checkpoint trong `output/` |
+| `finetune_det.py` | PP-OCRv6 text detection trên ảnh trang | detection labeler workspace hoặc `det_labels.txt` | `PaddleOCR/tools/train.py` | `output/`, tùy chọn `inference/best_accuracy/` |
+| `finetune_vl.py` | PaddleOCR-VL-1.6 OCR/table/formula/chart | export VL của layout labeler hoặc prepared run | ERNIEKit OCR-VL-SFT + LoRA | adapter và HF merged model trong `adapter/export/` |
+
+Hai utility của pipeline VL được trainer gọi tự động nhưng cũng có thể chạy độc lập:
+
+| Script | Mục đích |
+| --- | --- |
+| `evaluate_paddleocr_vl.py` | So sánh deterministic base/merged, tính CER, exact match, normalized edit distance và quality gate |
+| `merge_paddleocr_vl_lora.py` | Merge adapter ERNIEKit vào snapshot HF, kiểm tra weight merge và reload logits |
+
+`finetune_vl_layout.py` không tồn tại trong checkout này. Nhánh layout toàn trang
+được train bằng PaddleX theo lệnh ở phần
+[Dịch vụ gán nhãn layout](#dịch-vụ-gán-nhãn-layout-cho-paddleocr-vl-16).
+
+### Quy tắc chung
+
+1. Chạy `--prepare-only` trước hoặc kiểm tra `summary.json`/`rejected.jsonl` của
+   prepared run hiện có.
+2. Dùng một `--work-dir` mới cho mỗi thí nghiệm. Không đặt output trong thư mục
+   snapshot base model.
+3. Không dùng inference directory làm training checkpoint `.pdparams`.
+4. Ghi lại command, git SHA, model path/hash, dataset manifest/hash, peak VRAM,
+   checkpoint/export path và metric.
+5. Dataset nhỏ chỉ chứng minh pipeline có thể chạy/overfit; không suy diễn chất
+   lượng tổng quát từ train loss hoặc một validation sample.
+
+Các biến đường dẫn mẫu:
+
+```bash
+export REPO=/home/tieubaoca/AI/ocr/paddle-ocr
+export PADDLEOCR_DIR=$REPO/PaddleOCR
+export OUTPUT_ROOT=/media/tieubaoca/HDD1/F/finetune-output
+export VL_MODEL=/home/tieubaoca/AI/models/paddleocr-cache/official_models/PaddleOCR-VL-1.6
+export ERNIEKIT_DIR=$OUTPUT_ROOT/vl16_vi_experiment/runtime/erniekit
+cd "$REPO"
+```
+
+### A. PP-OCRv6 recognition — `finetune.py`
+
+#### Dataset contract
+
+`--dataset-dir` nhận một hoặc nhiều dataset Hugging Face đã `save_to_disk()`
+hoặc snapshot local chứa `data/*.parquet`. Mỗi row cần:
+
+- `image`: `datasets.Image`, PIL image, bytes/path dictionary hoặc path ảnh;
+- `label` hoặc `text`: ground truth string.
+
+Nếu source có split `validation`, `valid` hoặc `dev`, script dùng split đó. Nếu
+không có, script tách validation từ train theo từng source bằng
+`--validation-ratio`. Split `test` không tự động được dùng làm validation.
+Ảnh hợp lệ được materialize thành PNG lossless; sample lỗi được ghi vào
+`prepared/rejected.jsonl`, không truncate hoặc sửa target âm thầm.
+
+#### Bước 1: prepare-only
+
+```bash
+python finetune.py \
+  --dataset-dir /data/ocr_a /data/ocr_b \
+  --paddleocr-dir "$PADDLEOCR_DIR" \
+  --work-dir "$OUTPUT_ROOT/rec_prepare" \
+  --validation-ratio 0.02 \
+  --seed 2026 \
+  --prepare-only
+```
+
+Kiểm tra:
+
+```text
+$OUTPUT_ROOT/rec_prepare/prepared/summary.json
+$OUTPUT_ROOT/rec_prepare/prepared/rejected.jsonl
+$OUTPUT_ROOT/rec_prepare/prepared/train.txt
+$OUTPUT_ROOT/rec_prepare/prepared/validation.txt
+$OUTPUT_ROOT/rec_prepare/resolved_config.yml
+```
+
+#### Bước 2: train
+
+```bash
+python finetune.py \
+  --dataset-dir /data/ocr_a /data/ocr_b \
+  --paddleocr-dir "$PADDLEOCR_DIR" \
+  --work-dir "$OUTPUT_ROOT/rec_v1" \
+  --pretrained-model "$REPO/models/PP-OCRv6_medium_rec_pretrained.pdparams" \
+  --epochs 50 \
+  --learning-rate 3e-4 \
+  --batch-size 32 \
+  --num-workers 6
+```
+
+Nếu `--pretrained-model` là URL, script tải vào `<work-dir>/pretrained/`. Nếu là
+path local, file phải tồn tại. Nếu OOM, giảm `--batch-size` trước; chỉ giảm
+`--image-width` khi dữ liệu không có nhiều dòng dài.
+
+#### Toàn bộ args của `finetune.py`
+
+| Argument | Bắt buộc/default | Ý nghĩa |
+| --- | --- | --- |
+| `--dataset-dir PATH [PATH ...]` | Bắt buộc | Một hoặc nhiều dataset recognition để prepare và trộn. |
+| `--paddleocr-dir PATH` | Bắt buộc | Checkout PaddleOCR chứa `tools/train.py`. |
+| `--work-dir PATH` | `runs/vi_rec_YYYYmmdd_HHMMSS` | Thư mục run mới. |
+| `--config VALUE` | `configs/rec/PP-OCRv6/PP-OCRv6_medium_rec.yml` | Config tương đối với PaddleOCR checkout hoặc absolute path. |
+| `--pretrained-model VALUE` | URL PP-OCRv6 medium rec | URL hoặc file training weight local. |
+| `--validation-ratio FLOAT` | `0.02` | Tỷ lệ tách validation cho source thiếu validation; phải trong `(0, 0.5)`. |
+| `--seed INT` | `2026` | Seed split và shuffle. |
+| `--epochs INT` | `50` | Số epoch. |
+| `--learning-rate FLOAT` | `3e-4` | Learning rate recognition. |
+| `--batch-size INT` | `32` | Batch train trên mỗi card; eval batch được đặt khoảng hai lần giá trị này. |
+| `--num-workers INT` | `6` | Data loader workers; eval dùng ít nhất một worker. |
+| `--image-width INT` | `640` | Chiều rộng crop sau resize; tăng cho dòng dài. |
+| `--max-text-length INT` | `80` | Độ dài target tối đa; row dài hơn bị reject. |
+| `--max-image-pixels INT` | `50_000_000` | Giới hạn pixel ảnh nguồn trước decode/staging. |
+| `--character-dict PATH` | `vietnamese_dict.txt` | Dictionary một ký tự mỗi dòng. |
+| `--prepare-only` | Tắt | Chỉ prepare/filter/config; không tải weight và không train. |
+
+Output:
+
+```text
+<work-dir>/
+├── prepared/images/
+├── prepared/train.txt
+├── prepared/validation.txt
+├── prepared/rejected.jsonl
+├── prepared/summary.json
+├── pretrained/
+├── resolved_config.yml
+└── output/
+```
+
+### B. PP-OCRv6 detection — `finetune_det.py`
+
+Tài liệu chuyên sâu: [docs/finetune-ppocrv6-det.md](docs/finetune-ppocrv6-det.md).
+
+#### Dataset contract
+
+`--dataset-dir` nhận một hoặc nhiều:
+
+- workspace ảnh có `.paddleocr-det-labeler/det_labels.txt`;
+- chính thư mục `.paddleocr-det-labeler`;
+- path trực tiếp tới `det_labels.txt`.
+
+Mỗi dòng label:
+
+```text
+relative/image.png<TAB>[{"transcription":"text","points":[[x1,y1],...]}]
+```
+
+Script kiểm tra path, ảnh, JSON, polygon, bounds và diện tích. Ảnh trùng SHA-256
+được loại trước khi split để tránh leakage.
+
+#### Bước 1: prepare-only
+
+```bash
+python finetune_det.py \
+  --dataset-dir /data/pages_a /data/pages_b \
+  --paddleocr-dir "$PADDLEOCR_DIR" \
+  --work-dir "$OUTPUT_ROOT/det_prepare" \
+  --validation-ratio 0.10 \
+  --seed 2026 \
+  --prepare-only
+```
+
+#### Bước 2: train và export
+
+```bash
+python finetune_det.py \
+  --dataset-dir /data/pages_a /data/pages_b \
+  --paddleocr-dir "$PADDLEOCR_DIR" \
+  --work-dir "$OUTPUT_ROOT/det_v1" \
+  --pretrained-model "$REPO/models/PP-OCRv6_medium_det_pretrained.pdparams" \
+  --epochs 100 \
+  --batch-size 4 \
+  --export-after-train
+```
+
+Script từ chối inference directory và so shape toàn bộ pretrained tensor với
+PP-OCRv6 detector trước khi train.
+
+#### Toàn bộ args của `finetune_det.py`
+
+| Argument | Bắt buộc/default | Ý nghĩa |
+| --- | --- | --- |
+| `--dataset-dir PATH [PATH ...]` | Bắt buộc | Workspace, labeler dir hoặc `det_labels.txt`; hỗ trợ nhiều source. |
+| `--paddleocr-dir PATH` | `./PaddleOCR` | Checkout PaddleOCR. |
+| `--work-dir PATH` | `runs/vi_det_YYYYmmdd_HHMMSS` | Thư mục run mới. |
+| `--config VALUE` | `configs/det/PP-OCRv6/PP-OCRv6_medium_det.yml` | Config detection gốc; script giữ architecture/loss/transform chain. |
+| `--pretrained-model VALUE` | URL PP-OCRv6 medium det | URL hoặc file `.pdparams`; không nhận inference directory. |
+| `--validation-ratio FLOAT` | `0.10` | Tỷ lệ validation; phải trong `(0, 0.5)`. |
+| `--seed INT` | `2026` | Seed split và shuffle. |
+| `--epochs INT` | `100` | Số epoch. |
+| `--learning-rate FLOAT` | `1e-4` | Learning rate detection. |
+| `--batch-size INT` | `4` | Batch mỗi card; giảm xuống `3`, rồi `2` khi OOM. |
+| `--num-workers INT` | `4` | Data loader workers. |
+| `--eval-batch-step INT` | `200` | Chu kỳ evaluation theo step. |
+| `--save-epoch-step INT` | `5` | Chu kỳ lưu checkpoint theo epoch. |
+| `--max-image-pixels INT` | `50_000_000` | Giới hạn pixel ảnh nguồn. |
+| `--min-polygon-area FLOAT` | `4.0` | Diện tích polygon tối thiểu; box nhỏ hơn bị reject. |
+| `--disable-amp` | Tắt | Tắt AMP; mặc định AMP bật. |
+| `--prepare-only` | Tắt | Chỉ validate/stage/config. |
+| `--export-after-train` | Tắt | Export best checkpoint sang `inference/best_accuracy`. |
+
+Output:
+
+```text
+<work-dir>/
+├── prepared/images/
+├── prepared/train.txt
+├── prepared/validation.txt
+├── prepared/rejected.jsonl
+├── prepared/summary.json
+├── pretrained/
+├── resolved_config.yml
+├── output/
+└── inference/best_accuracy/    # khi có --export-after-train
+```
+
+### C. PaddleOCR-VL-1.6 LoRA — `finetune_vl.py`
+
+Tài liệu cài đặt/runtime chuyên sâu:
+[docs/finetune-paddleocr-vl-1.6.md](docs/finetune-paddleocr-vl-1.6.md).
+Pipeline này dùng ERNIEKit release/v1.5, không dùng `PaddleOCR/tools/train.py`.
+
+#### Dataset và task contract
+
+Dataset labeler chuẩn có split `train`/`validation` và các cột `image`, `text`,
+`task`, `source_page_id`.
+
+| `task` | Prompt | Target |
+| --- | --- | --- |
+| `ocr` | `OCR:` | Text OCR, giữ newline |
+| `table` | `Table Recognition:` | OTSL canonical, không phải HTML |
+| `formula` | `Formula Recognition:` | LaTeX |
+| `chart` | `Chart Recognition:` | Markdown table |
+
+Cột `task` trên row được ưu tiên. Row thiếu task dùng `--task`. Với nhiều source
+thiếu task, truyền một `--dataset-task` cho mỗi `--dataset-dir` theo đúng thứ tự.
+Không dùng `--dataset-dir` và `--prepared-from` cùng lúc.
+
+#### Bước 1: prepare-only
+
+```bash
+python finetune_vl.py \
+  --dataset-dir /path/to/export/vl \
+  --model "$VL_MODEL" \
+  --work-dir "$OUTPUT_ROOT/vl_prepare" \
+  --prepare-only
+```
+
+Prepare-only không cần ERNIEKit và không load model. Giữ nguyên prepared run vì
+`--prepared-from` tham chiếu trực tiếp JSONL/ảnh, không copy lại.
+
+#### Bước 2: inspect LoRA scope
+
+```bash
+CUDA_VISIBLE_DEVICES=0 \
+$ERNIEKIT_DIR/.venv/bin/python finetune_vl.py \
+  --prepared-from "$OUTPUT_ROOT/vl_prepare" \
+  --erniekit-dir "$ERNIEKIT_DIR" \
+  --model "$VL_MODEL" \
+  --work-dir "$OUTPUT_ROOT/vl_inspect" \
+  --inspect-model \
+  --gradient-accumulation-steps 16 \
+  --eval-samples-per-dataset 4 \
+  --devices 0
+```
+
+Inspect phải xác nhận LoRA chỉ ở text decoder, vision frozen và không có adapter
+tensor thuộc vision encoder.
+
+#### Bước 3: smoke test
+
+```bash
+CUDA_VISIBLE_DEVICES=0 \
+$ERNIEKIT_DIR/.venv/bin/python finetune_vl.py \
+  --prepared-from "$OUTPUT_ROOT/vl_prepare" \
+  --erniekit-dir "$ERNIEKIT_DIR" \
+  --model "$VL_MODEL" \
+  --work-dir "$OUTPUT_ROOT/vl_smoke" \
+  --smoke-steps 3 \
+  --gradient-accumulation-steps 16 \
+  --eval-samples-per-dataset 4 \
+  --max-pixels 250880 \
+  --max-seq-len 4096 \
+  --devices 0
+```
+
+Nếu FlashAttention không tương thích, thêm `--no-flash-attention`. Smoke phải tạo
+adapter/checkpoint, merged model, `merge_verification.json`,
+`logits_verification.json` và evaluator output.
+
+#### Bước 4: pilot labeler-only
+
+```bash
+CUDA_VISIBLE_DEVICES=0 \
+$ERNIEKIT_DIR/.venv/bin/python finetune_vl.py \
+  --prepared-from "$OUTPUT_ROOT/vl_prepare" \
+  --erniekit-dir "$ERNIEKIT_DIR" \
+  --model "$VL_MODEL" \
+  --work-dir "$OUTPUT_ROOT/vl_labeler_pilot" \
+  --epochs 30 \
+  --learning-rate 1e-4 \
+  --lora-rank 32 \
+  --gradient-accumulation-steps 16 \
+  --save-steps 10 \
+  --eval-samples-per-dataset 4 \
+  --eval-max-checkpoints 3 \
+  --max-pixels 250880 \
+  --max-seq-len 4096 \
+  --devices 0
+```
+
+Với chỉ `35` train samples, đây là feasibility/overfit pilot. Cần validation có
+nhiều OCR và table crop trước khi dùng metric để kết luận chất lượng.
+
+#### Bước 5: resume
+
+Resume dùng checkpoint thuộc chính `--work-dir`; không truyền `--prepared-from`:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 \
+$ERNIEKIT_DIR/.venv/bin/python finetune_vl.py \
+  --erniekit-dir "$ERNIEKIT_DIR" \
+  --model "$VL_MODEL" \
+  --work-dir "$OUTPUT_ROOT/vl_labeler_pilot" \
+  --resume-from "$OUTPUT_ROOT/vl_labeler_pilot/adapter/checkpoint-60" \
+  --devices 0
+```
+
+#### Toàn bộ args của `finetune_vl.py`
+
+| Argument | Bắt buộc/default | Ý nghĩa |
+| --- | --- | --- |
+| `--task {ocr,table,formula,chart}` | `ocr` | Task mặc định cho row không có cột `task`. |
+| `--dataset-dir PATH [PATH ...]` | Một trong hai với `--prepared-from` | Dataset VL raw; hỗ trợ nhiều source. |
+| `--dataset-task TASK [TASK ...]` | Không có | Task mặc định từng source, cùng thứ tự `--dataset-dir`. |
+| `--prepared-from PATH` | Một trong hai với `--dataset-dir` | Dùng lại run `--prepare-only`; không copy JSONL/ảnh. |
+| `--erniekit-dir PATH` | Bắt buộc khi train/inspect | Checkout ERNIEKit release/v1.5; không cần cho prepare-only. |
+| `--model PATH_OR_ID` | `PaddlePaddle/PaddleOCR-VL-1.6` | Model; train yêu cầu local snapshot hợp lệ. |
+| `--work-dir PATH` | Tự sinh timestamp | Thư mục run; resume phải dùng đúng run này. |
+| `--prepare-only` | Tắt | Chỉ validate/stage; cấm dùng với `--prepared-from`. |
+| `--smoke-steps INT` | Không có | Override `max_steps` cho smoke; phải dương. |
+| `--resume-from PATH` | Không có | Resume adapter checkpoint; cấm dùng với `--prepared-from`. |
+| `--inspect-model` | Tắt | Inspect trainable LoRA rồi dừng trước train. |
+| `--epochs FLOAT` | `3.0` | Số epoch logic; script tự tính optimizer `max_steps`. |
+| `--learning-rate FLOAT` | `1e-4` | Learning rate LoRA. |
+| `--lora-rank INT` | `32` | LoRA rank; alpha bằng `2 * rank`. |
+| `--min-pixels INT` | `50176` | Pixel tối thiểu khi smart-resize (`64 * 28 * 28`). |
+| `--max-pixels INT` | `451584` | Pixel tối đa khi smart-resize (`576 * 28 * 28`). |
+| `--max-image-pixels INT` | `50_000_000` | Giới hạn ảnh nguồn. |
+| `--max-seq-len INT` | `2048` | Giới hạn prompt/image/target token; sample vượt bị reject, không truncate target. |
+| `--gradient-accumulation-steps INT` | `32` | Số micro-batch trước optimizer step; micro-batch mặc định là 1. |
+| `--validation-ratio FLOAT` | `0.02` | Tách validation cho source raw thiếu validation; trong `(0, 0.5)`. |
+| `--num-workers INT` | `2` | Data loader workers. |
+| `--prefetch-factor INT` | `2` | Batch prefetch mỗi worker. |
+| `--seed INT` | `2026` | Seed prepare/sampling/runtime. |
+| `--eval-samples-per-dataset INT` | `32` | Số validation row tối đa mỗi source. |
+| `--eval-max-new-tokens INT` | `1024` | Generation limit chung. |
+| `--eval-task-max-new-tokens TASK=INT` | Không có, lặp được | Override generation limit theo task, ví dụ `table=2048`. |
+| `--eval-max-checkpoints INT` | `3` | Số checkpoint gần nhất cộng adapter cuối được chấm. |
+| `--min-normalized-edit-distance FLOAT` | `0.5` | NED tối thiểu; trong `[0, 1]`. |
+| `--max-cer FLOAT` | `1.0` | CER tối đa; không âm. |
+| `--save-steps INT` | `100` | Chu kỳ lưu checkpoint theo optimizer step. |
+| `--skip-evaluation` | Tắt | Bỏ native evaluator/checkpoint selection; vẫn merge/verify, không dùng cho quality claim. |
+| `--devices VALUE` | `CUDA_VISIBLE_DEVICES` hoặc `0` | GPU ID comma-separated; ví dụ `0` hoặc `0,1`. |
+| `--no-flash-attention` | Tắt | Tắt FlashAttention khi runtime/hardware không tương thích. |
+
+Resolved config cố định decoder-only LoRA, vision frozen, BF16/O2, full
+recompute, cosine LR, warmup `0.03`, weight decay `0.01`, micro-batch 1 và
+`do_eval: false`. Validation được chấm bằng native evaluator, không phải Trainer
+validation loss.
+
+Output:
+
+```text
+<work-dir>/
+├── prepared/                 # chỉ có khi prepare từ raw source trong run này
+├── rejected.jsonl
+├── summary.json
+├── resolved.yaml
+├── adapter/
+│   ├── checkpoint-*/
+│   ├── lora_config.json
+│   └── export/
+│       ├── model.safetensors
+│       ├── merge_verification.json
+│       └── logits_verification.json
+├── export.yaml
+├── export_manifest.json
+├── logs/
+├── metrics/
+└── tensorboard_logs/
+```
+
+### D. Native evaluator — `evaluate_paddleocr_vl.py`
+
+Trainer VL gọi utility này tự động. Chạy độc lập để chấm lại merged model:
+
+```bash
+.venv-vl-eval/bin/python evaluate_paddleocr_vl.py \
+  --base-model "$VL_MODEL" \
+  --merged-model "$OUTPUT_ROOT/vl_labeler_pilot/adapter/export" \
+  --validation-jsonl "$OUTPUT_ROOT/vl_prepare/prepared/validation-source-000.jsonl" \
+  --output-dir "$OUTPUT_ROOT/vl_labeler_pilot/manual_eval" \
+  --samples-per-dataset 8 \
+  --max-new-tokens 1024 \
+  --task-max-new-tokens table=2048 \
+  --min-normalized-edit-distance 0.5 \
+  --max-cer 1.0
+```
+
+#### Toàn bộ args của `evaluate_paddleocr_vl.py`
+
+| Argument | Bắt buộc/default | Ý nghĩa |
+| --- | --- | --- |
+| `--base-model PATH` | Bắt buộc | Snapshot base để tạo baseline. |
+| `--merged-model PATH` | Bắt buộc | HF merged model cần đánh giá. |
+| `--validation-jsonl PATH [PATH ...]` | Bắt buộc | Một hoặc nhiều validation JSONL. |
+| `--output-dir PATH` | Bắt buộc | Nơi ghi metrics/predictions. |
+| `--samples-per-dataset INT` | `32` | Số row tối đa mỗi JSONL; phải dương. |
+| `--max-new-tokens INT` | `1024` | Generation limit chung. |
+| `--task-max-new-tokens TASK=INT` | Không có, lặp được | Generation limit riêng task. |
+| `--min-normalized-edit-distance FLOAT` | `0.5` | Ngưỡng NED quality gate. |
+| `--max-cer FLOAT` | `1.0` | Ngưỡng CER quality gate. |
+| `--base-predictions-jsonl PATH` | Không có | Tái sử dụng base predictions khi chấm nhiều checkpoint. |
+| `--report-only` | Tắt | Ghi failed report nhưng không trả non-zero; chỉ dùng smoke/screening. |
+
+Output chính: `ocr_metrics.json`, `ocr_predictions.jsonl`, metric overall/theo
+source/theo task và trạng thái EOS/token limit.
+
+### E. Merge utility — `merge_paddleocr_vl_lora.py`
+
+```bash
+CUDA_VISIBLE_DEVICES=0 \
+$ERNIEKIT_DIR/.venv/bin/python merge_paddleocr_vl_lora.py \
+  --base-model "$VL_MODEL" \
+  --adapter-dir "$OUTPUT_ROOT/vl_labeler_pilot/adapter" \
+  --output-dir "$OUTPUT_ROOT/vl_labeler_pilot/manual_merge" \
+  --fixture-jsonl "$OUTPUT_ROOT/vl_prepare/prepared/validation-source-000.jsonl" \
+  --min-pixels 50176 \
+  --max-pixels 250880
+```
+
+#### Toàn bộ args của `merge_paddleocr_vl_lora.py`
+
+| Argument | Bắt buộc | Ý nghĩa |
+| --- | --- | --- |
+| `--base-model PATH` | Có | Base HF snapshot có `model_type=paddleocr_vl`. |
+| `--adapter-dir PATH` | Có | Adapter chứa `lora_config.json` và weights. |
+| `--output-dir PATH` | Có | Output mới; không nằm trong base và không chứa safetensors cũ. |
+| `--fixture-jsonl PATH` | Có | JSONL dùng kiểm tra logits trước/sau merge. |
+| `--min-pixels INT` | Có | Min resize giống train/eval. |
+| `--max-pixels INT` | Có | Max resize giống train/eval. |
+
+Merge phải tạo `model.safetensors`, `merge_verification.json` và
+`logits_verification.json`; cả hai verification phải có status `passed`.
+
+### F. Quality gate và checkpoint selection VL
+
+Full run evaluate adapter cuối và tối đa `--eval-max-checkpoints` checkpoint gần
+nhất. Checkpoint được chọn theo CER, exact match và normalized edit distance,
+không theo train loss đơn thuần. Chỉ gọi model `passed` khi:
+
+- LoRA scope không có tensor vision;
+- base model không bị sửa;
+- merge verification pass;
+- logit reload verification pass;
+- evaluator không chạm token limit bất thường;
+- merged không regression rõ ràng so với base;
+- metric vượt thresholds đã khai báo.
+
+Kiểm tra đồng thời:
+
+```text
+metrics/ocr_metrics.json
+metrics/ocr_predictions.jsonl
+metrics/checkpoint_selection.json
+adapter/export/merge_verification.json
+adapter/export/logits_verification.json
+export_manifest.json
+```
+
+### G. Lỗi thường gặp
+
+| Triệu chứng | Xử lý |
+| --- | --- |
+| Dùng cùng `--dataset-dir` và `--prepared-from` | Chọn raw mode hoặc prepared mode, không chọn cả hai. |
+| VL thiếu task | Thêm cột `task`, hoặc dùng `--task`/`--dataset-task` đúng thứ tự source. |
+| Table bị reject | Dùng OTSL canonical, không dùng HTML. |
+| CUDA OOM VL | Giảm `--max-pixels`, giữ micro-batch 1, thử `--no-flash-attention`; không mở LoRA vision. |
+| CUDA OOM rec/det | Giảm `--batch-size` trước; recognition mới cân nhắc giảm `--image-width`. |
+| Detection pretrained mismatch | Dùng training `.pdparams` đúng model, không dùng inference directory. |
+| AMP/GradScaler lỗi NumPy | Cài dependency đã pin, đặc biệt `numpy<2.4`. |
+| Validation quá ít | Bổ sung validation theo page/task; không hạ gate chỉ để tuyên bố pass. |
+| Merge output tồn tại | Chọn output mới; utility cố ý không ghi đè safetensors. |
+
+### H. Kiểm tra trước bàn giao
+
+```bash
+PYTHONPATH=. pytest -q \
+  tests/test_finetune.py \
+  tests/test_finetune_det.py \
+  tests/test_finetune_vl.py \
+  tests/test_finetune_vl_layout.py
+
+bash -n download_pretrained_models.sh
+python finetune.py --help >/tmp/finetune-rec-help.txt
+python finetune_det.py --help >/tmp/finetune-det-help.txt
+python finetune_vl.py --help >/tmp/finetune-vl-help.txt
+python evaluate_paddleocr_vl.py --help >/tmp/evaluate-vl-help.txt
+python merge_paddleocr_vl_lora.py --help >/tmp/merge-vl-help.txt
+```
