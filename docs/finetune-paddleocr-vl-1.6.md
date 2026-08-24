@@ -176,6 +176,25 @@ vậy không được xóa hay di chuyển run prepare trong khi còn dùng chec
 `task=mixed`. Summary cũ không có `task` vẫn được hiểu là OCR. Evaluator và merge
 đọc prompt từ từng dòng JSONL, không khóa một task cho cả run.
 
+Có thể truyền nhiều run qua cùng option. Khi đó phải truyền đúng một relative
+weight dương, hữu hạn cho mỗi run; script normalize tự động, giữ probability nội
+bộ của từng run, rồi scale source probability cho cả train và validation. Source
+được flatten theo thứ tự run rồi thứ tự source; task được union. Mọi run phải ghi
+cùng base model trong metadata.
+
+```bash
+python -u finetune_vl.py \
+  --prepared-from runs/vl16_vi_prepare runs/vl16_labeler_prepare \
+  --prepared-weight 95 5 \
+  --erniekit-dir /opt/ERNIE \
+  --model "$MODEL" \
+  --work-dir runs/vl16_vi_labeler_95_5 \
+  --devices 0
+```
+
+Ví dụ trên tạo probability run `0.95/0.05`. Run train mới chỉ ghi metadata,
+config, checkpoint và metric; JSONL/ảnh vẫn nằm tại hai prepared run nguồn.
+
 Với dataset và model hiện có trên máy này, chạy full LoRA bằng lệnh:
 
 ```bash
@@ -411,7 +430,8 @@ model tốt hơn base.
 | `--task {ocr,table,formula,chart}` | `ocr` | Task mặc định cho row thiếu cột `task`. Row-level task luôn được ưu tiên. |
 | `--dataset-dir PATH [PATH ...]` | Một trong hai với `--prepared-from` | Raw dataset source; hỗ trợ nhiều source. |
 | `--dataset-task TASK [TASK ...]` | Không có | Task mặc định cho từng source, cùng số lượng/thứ tự `--dataset-dir`. |
-| `--prepared-from PATH` | Một trong hai với `--dataset-dir` | Dùng lại JSONL/ảnh của run prepare; cấm với prepare-only/resume. |
+| `--prepared-from PATH [PATH ...]` | Một trong hai với `--dataset-dir` | Dùng lại JSONL/ảnh của một hoặc nhiều run prepare; cấm với prepare-only/resume. |
+| `--prepared-weight WEIGHT [WEIGHT ...]` | `1.0` cho một run; bắt buộc khi nhiều run | Relative weight dương, hữu hạn, cùng số lượng/thứ tự prepared run; tự normalize. |
 | `--erniekit-dir PATH` | Bắt buộc khi không prepare-only | ERNIEKit release/v1.5 checkout đã pin và có runtime Python. |
 | `--model PATH_OR_ID` | `PaddlePaddle/PaddleOCR-VL-1.6` | Base model; inspect/train yêu cầu local snapshot hợp lệ. |
 | `--work-dir PATH` | Timestamp run | Run output mới; resume dùng đúng run cũ. |
@@ -447,6 +467,9 @@ Các tổ hợp bị cấm:
 - `--dataset-dir` cùng `--prepared-from`;
 - `--prepared-from` cùng `--prepare-only`;
 - `--prepared-from` cùng `--resume-from`;
+- `--prepared-weight` không có `--prepared-from`;
+- nhiều prepared run không có weight, weight bằng `0`, âm, NaN hoặc sai số lượng;
+- prepared run dùng base model khác nhau;
 - `--dataset-task` không có `--dataset-dir` hoặc số task khác số source.
 
 ## Chạy evaluator độc lập

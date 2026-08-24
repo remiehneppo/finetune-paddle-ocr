@@ -4,7 +4,9 @@ Pipeline LoRA cho **PaddleOCR-VL-1.6** được tài liệu riêng tại
 [docs/finetune-paddleocr-vl-1.6.md](docs/finetune-paddleocr-vl-1.6.md). Pipeline
 này dùng ERNIEKit và môi trường tách biệt với PP-OCRv6 bên dưới. Dataset VL đã
 prepare có thể dùng lại bằng `finetune_vl.py --prepared-from <prepare-run>` mà
-không sao chép hoặc xử lý lại ảnh. OCR/table/formula/chart dùng chung
+không sao chép hoặc xử lý lại ảnh. Có thể hợp nhất nhiều prepared run trực tiếp
+bằng cùng option và relative weight, ví dụ `--prepared-weight 95 5`.
+OCR/table/formula/chart dùng chung
 `finetune_vl.py`; trộn nhiều layout trong một run qua cột `task` trong dataset
 để hạn chế phá các khả năng layout khác.
 
@@ -544,7 +546,22 @@ python finetune_vl.py \
 ```
 
 Prepare-only không cần ERNIEKit và không load model. Giữ nguyên prepared run vì
-`--prepared-from` tham chiếu trực tiếp JSONL/ảnh, không copy lại.
+`--prepared-from` tham chiếu trực tiếp JSONL/ảnh, không copy lại. Khi cần trộn
+prepared corpus cũ với export labeler mới, truyền nhiều run và weight tương ứng:
+
+```bash
+$ERNIEKIT_DIR/.venv/bin/python finetune_vl.py \
+  --prepared-from "$OUTPUT_ROOT/vl_prepare" "$OUTPUT_ROOT/vl_labeler_prepare" \
+  --prepared-weight 95 5 \
+  --erniekit-dir "$ERNIEKIT_DIR" \
+  --model "$VL_MODEL" \
+  --work-dir "$OUTPUT_ROOT/vl_mixed_95_5" \
+  --devices 0
+```
+
+Weight được normalize thành `0.95/0.05`, áp dụng giống nhau cho train và
+validation, đồng thời giữ probability nội bộ của từng prepared run. Các run phải
+dùng cùng base model; task được union và source giữ đúng thứ tự input.
 
 #### Bước 2: inspect LoRA scope
 
@@ -630,7 +647,8 @@ $ERNIEKIT_DIR/.venv/bin/python finetune_vl.py \
 | `--task {ocr,table,formula,chart}` | `ocr` | Task mặc định cho row không có cột `task`. |
 | `--dataset-dir PATH [PATH ...]` | Một trong hai với `--prepared-from` | Dataset VL raw; hỗ trợ nhiều source. |
 | `--dataset-task TASK [TASK ...]` | Không có | Task mặc định từng source, cùng thứ tự `--dataset-dir`. |
-| `--prepared-from PATH` | Một trong hai với `--dataset-dir` | Dùng lại run `--prepare-only`; không copy JSONL/ảnh. |
+| `--prepared-from PATH [PATH ...]` | Một trong hai với `--dataset-dir` | Dùng lại một hoặc nhiều run `--prepare-only`; không copy JSONL/ảnh. |
+| `--prepared-weight WEIGHT [WEIGHT ...]` | Mặc định `1.0` cho một run; bắt buộc khi nhiều run | Positive relative weight theo đúng thứ tự prepared run; tự normalize. |
 | `--erniekit-dir PATH` | Bắt buộc khi train/inspect | Checkout ERNIEKit release/v1.5; không cần cho prepare-only. |
 | `--model PATH_OR_ID` | `PaddlePaddle/PaddleOCR-VL-1.6` | Model; train yêu cầu local snapshot hợp lệ. |
 | `--work-dir PATH` | Tự sinh timestamp | Thư mục run; resume phải dùng đúng run này. |
@@ -781,6 +799,7 @@ export_manifest.json
 | Triệu chứng | Xử lý |
 | --- | --- |
 | Dùng cùng `--dataset-dir` và `--prepared-from` | Chọn raw mode hoặc prepared mode, không chọn cả hai. |
+| Nhiều prepared run thiếu/sai `--prepared-weight` | Truyền đúng một số dương hữu hạn cho mỗi run, ví dụ `95 5`. |
 | VL thiếu task | Thêm cột `task`, hoặc dùng `--task`/`--dataset-task` đúng thứ tự source. |
 | Table bị reject | Dùng OTSL canonical, không dùng HTML. |
 | CUDA OOM VL | Giảm `--max-pixels`, giữ micro-batch 1, thử `--no-flash-attention`; không mở LoRA vision. |

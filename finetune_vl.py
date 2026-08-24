@@ -170,7 +170,21 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--prepared-from",
         type=Path,
-        help="Reuse JSONL and images from an existing --prepare-only run.",
+        nargs="+",
+        help=(
+            "Reuse JSONL and images from one or more existing --prepare-only "
+            "runs. Multiple runs require matching --prepared-weight values."
+        ),
+    )
+    parser.add_argument(
+        "--prepared-weight",
+        type=float,
+        nargs="+",
+        metavar="WEIGHT",
+        help=(
+            "Positive relative weight for each --prepared-from run. Required "
+            "for multiple runs and normalized automatically."
+        ),
     )
     parser.add_argument(
         "--erniekit-dir",
@@ -222,7 +236,10 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--no-flash-attention", dest="flash_attention", action="store_false"
     )
     parser.set_defaults(flash_attention=True)
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    if args.prepared_from is not None and len(args.prepared_from) == 1:
+        args.prepared_from = args.prepared_from[0]
+    return args
 
 
 def parse_task_token_limits(values: Sequence[str]) -> dict[str, int]:
@@ -245,10 +262,38 @@ def parse_task_token_limits(values: Sequence[str]) -> dict[str, int]:
     return limits
 
 
+def normalize_prepared_weights(
+    prepared_runs: Sequence[Path], prepared_weights: Sequence[float] | None
+) -> list[float]:
+    if not prepared_runs:
+        raise ValueError("At least one --prepared-from run is required")
+    if prepared_weights is None:
+        if len(prepared_runs) > 1:
+            raise ValueError(
+                "Multiple --prepared-from runs require one --prepared-weight "
+                "value per run"
+            )
+        return [1.0]
+    weights = list(prepared_weights)
+    if len(weights) != len(prepared_runs):
+        raise ValueError(
+            "--prepared-weight must contain one value per --prepared-from run"
+        )
+    if not all(math.isfinite(weight) and weight > 0 for weight in weights):
+        raise ValueError("--prepared-weight values must be finite and positive")
+    total_weight = sum(weights)
+    return [weight / total_weight for weight in weights]
+
+
 def validate_args(args: argparse.Namespace) -> None:
     prompt_for_task(args.task)
     has_datasets = bool(args.dataset_dir)
     has_prepared = args.prepared_from is not None
+    prepared_runs = (
+        [args.prepared_from]
+        if isinstance(args.prepared_from, Path)
+        else list(args.prepared_from or ())
+    )
     if has_datasets and has_prepared:
         raise ValueError("--dataset-dir and --prepared-from cannot be used together")
     if args.resume_from is None and not has_datasets and not has_prepared:
@@ -257,6 +302,12 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--prepared-from cannot be used with --prepare-only")
     if has_prepared and args.resume_from is not None:
         raise ValueError("--prepared-from cannot be used with --resume-from")
+    if args.prepared_weight is not None and not has_prepared:
+        raise ValueError("--prepared-weight requires --prepared-from")
+    if has_prepared:
+        args.prepared_weight = normalize_prepared_weights(
+            prepared_runs, args.prepared_weight
+        )
     if args.dataset_task and not has_datasets:
         raise ValueError("--dataset-task requires --dataset-dir")
     if args.dataset_task and len(args.dataset_task) != len(args.dataset_dir):
@@ -265,9 +316,10 @@ def validate_args(args: argparse.Namespace) -> None:
     missing = [str(path) for path in (args.dataset_dir or ()) if not path.is_dir()]
     if missing:
         raise FileNotFoundError(f"Dataset directories not found: {missing}")
-    if has_prepared and not args.prepared_from.is_dir():
+    missing_prepared = [str(path) for path in prepared_runs if not path.is_dir()]
+    if missing_prepared:
         raise FileNotFoundError(
-            f"Prepared run directory not found: {args.prepared_from}"
+            f"Prepared run directories not found: {missing_prepared}"
         )
     if not 0.0 < args.validation_ratio < 0.5:
         raise ValueError("--validation-ratio must be between 0 and 0.5")
@@ -879,9 +931,7 @@ def _normalize_summary_tasks(summary: dict[str, Any]) -> list[str]:
     return tasks
 
 
-def load_prepared_run(
-    prepared_from: Path, work_dir: Path
-) -> dict[str, Any]:
+def read_prepared_run(prepared_from: Path) -> dict[str, Any]:
     prepared_run = prepared_from.expanduser().resolve()
     summary_path = prepared_run / "summary.json"
     if not summary_path.is_file():
@@ -903,22 +953,27 @@ def load_prepared_run(
         if not isinstance(probabilities, list) or len(probabilities) != len(sources):
             raise ValueError(f"Prepared summary has invalid {field}")
         if not all(
-            isinstance(value, (int, float)) and value >= 0 for value in probabilities
+            isinstance(value, (int, float))
+            and math.isfinite(value)
+            and value >= 0
+            for value in probabilities
         ) or not math.isclose(sum(probabilities), 1.0, rel_tol=1e-6, abs_tol=1e-6):
             raise ValueError(f"Prepared summary has invalid {field}")
 
     totals = {"train": 0, "validation": 0}
+    resolved_sources: list[dict[str, Any]] = []
     for source_index, source in enumerate(sources):
         if not isinstance(source, dict):
             raise TypeError(f"Prepared source {source_index} must be an object")
+        resolved_source = dict(source)
         for split in ("train", "validation"):
             path_field = f"{split}_jsonl"
             count_field = f"{split}_samples"
             jsonl_path = _resolve_reused_path(
-                source.get(path_field), prepared_run, path_field
+                resolved_source.get(path_field), prepared_run, path_field
             )
             actual_count = _validate_prepared_jsonl(jsonl_path, allowed_prompts)
-            expected_count = source.get(count_field)
+            expected_count = resolved_source.get(count_field)
             if not isinstance(expected_count, int) or expected_count <= 0:
                 raise ValueError(
                     f"Prepared source {source_index} has invalid {count_field}"
@@ -928,8 +983,9 @@ def load_prepared_run(
                     f"Prepared source {source_index} {count_field} is "
                     f"{expected_count}, but {jsonl_path} contains {actual_count}"
                 )
-            source[path_field] = str(jsonl_path)
+            resolved_source[path_field] = str(jsonl_path)
             totals[split] += actual_count
+        resolved_sources.append(resolved_source)
 
     for split, actual_count in totals.items():
         count_field = f"{split}_samples"
@@ -939,12 +995,115 @@ def load_prepared_run(
                 f"but sources contain {actual_count}"
             )
 
+    summary["sources"] = resolved_sources
     summary["prepared_from"] = str(prepared_run)
+    return summary
+
+
+def aggregate_prepared_runs(
+    prepared_from: Sequence[Path],
+    prepared_weights: Sequence[float] | None,
+    work_dir: Path,
+) -> dict[str, Any]:
+    normalized_weights = normalize_prepared_weights(prepared_from, prepared_weights)
+    run_summaries = [read_prepared_run(path) for path in prepared_from]
+    models = [summary.get("model") for summary in run_summaries]
+    if any(not isinstance(model, str) or not model for model in models):
+        raise ValueError("Every prepared summary must record a non-empty model")
+    if len(set(models)) != 1:
+        raise ValueError(f"Prepared runs use different base models: {models}")
+
+    sources: list[dict[str, Any]] = []
+    train_probabilities: list[float] = []
+    validation_probabilities: list[float] = []
+    tasks: set[str] = set()
+    source_runs: list[str] = []
+    rejected: Counter[str] = Counter()
+    for run_summary, run_weight in zip(
+        run_summaries, normalized_weights, strict=True
+    ):
+        run_path = run_summary["prepared_from"]
+        run_sources = run_summary["sources"]
+        sources.extend(run_sources)
+        source_runs.extend(run_path for _ in run_sources)
+        train_probabilities.extend(
+            run_weight * value for value in run_summary["train_probabilities"]
+        )
+        validation_probabilities.extend(
+            run_weight * value for value in run_summary["validation_probabilities"]
+        )
+        tasks.update(run_summary["tasks"])
+        run_rejected = run_summary.get("rejected", {})
+        if isinstance(run_rejected, Mapping):
+            rejected.update(
+                {
+                    str(reason): count
+                    for reason, count in run_rejected.items()
+                    if isinstance(count, int)
+                }
+            )
+
+    for field, probabilities in (
+        ("train_probabilities", train_probabilities),
+        ("validation_probabilities", validation_probabilities),
+    ):
+        if not math.isclose(sum(probabilities), 1.0, rel_tol=1e-6, abs_tol=1e-6):
+            raise ValueError(f"Aggregated {field} does not sum to 1.0")
+
+    ordered_tasks = sorted(tasks)
+    summary: dict[str, Any] = {
+        "task": ordered_tasks[0] if len(ordered_tasks) == 1 else "mixed",
+        "tasks": ordered_tasks,
+        "prompts": [prompt_for_task(task) for task in ordered_tasks],
+        "model": models[0],
+        "sources": sources,
+        "source_runs": source_runs,
+        "train_samples": sum(summary["train_samples"] for summary in run_summaries),
+        "validation_samples": sum(
+            summary["validation_samples"] for summary in run_summaries
+        ),
+        "train_probabilities": train_probabilities,
+        "validation_probabilities": validation_probabilities,
+        "prepared_from_runs": [summary["prepared_from"] for summary in run_summaries],
+        "prepared_weights": normalized_weights,
+        "prepared_weight_policy": "relative_normalized",
+        "rejected": dict(sorted(rejected.items())),
+    }
+    if len(ordered_tasks) == 1:
+        summary["prompt"] = prompt_for_task(ordered_tasks[0])
+
     work_dir.mkdir(parents=True, exist_ok=True)
     (work_dir / "summary.json").write_text(
         json.dumps(summary, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
     )
     return summary
+
+
+def load_prepared_runs(
+    prepared_from: Path | Sequence[Path],
+    prepared_weights: Sequence[float] | None,
+    work_dir: Path,
+) -> dict[str, Any]:
+    prepared_runs = (
+        [prepared_from] if isinstance(prepared_from, Path) else list(prepared_from)
+    )
+    weights = normalize_prepared_weights(prepared_runs, prepared_weights)
+    if len(prepared_runs) == 1:
+        summary = read_prepared_run(prepared_runs[0])
+        summary["prepared_weights"] = weights
+        summary["prepared_weight_policy"] = "relative_normalized"
+        summary["source_runs"] = [summary["prepared_from"]] * len(summary["sources"])
+        work_dir.mkdir(parents=True, exist_ok=True)
+        (work_dir / "summary.json").write_text(
+            json.dumps(summary, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        return summary
+    return aggregate_prepared_runs(prepared_runs, prepared_weights, work_dir)
+
+
+def load_prepared_run(prepared_from: Path, work_dir: Path) -> dict[str, Any]:
+    return load_prepared_runs(prepared_from, [1.0], work_dir)
 
 
 def _csv(values: Iterable[Any]) -> str:
@@ -1883,7 +2042,16 @@ def main(
         summary, config_path = _load_existing_run(work_dir)
         config_path = create_resume_config(config_path, work_dir, args)
     elif args.prepared_from is not None:
-        summary = load_prepared_run(args.prepared_from, work_dir)
+        prepared_runs = (
+            [args.prepared_from]
+            if isinstance(args.prepared_from, Path)
+            else args.prepared_from
+        )
+        summary = load_prepared_runs(
+            prepared_runs,
+            args.prepared_weight,
+            work_dir,
+        )
         config_path = work_dir / "resolved.yaml"
         create_resolved_config(config_path, work_dir, summary, args)
     else:

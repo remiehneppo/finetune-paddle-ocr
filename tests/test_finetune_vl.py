@@ -68,6 +68,264 @@ class FinetuneVLTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "prepared|dataset|resume"):
                     finetune_vl.validate_args(parsed)
 
+    def _write_prepared_fixture(
+        self,
+        root,
+        name,
+        task="ocr",
+        train_count=1,
+        validation_count=1,
+        model="PaddlePaddle/PaddleOCR-VL-1.6",
+    ):
+        prepared_run = root / name
+        prepared = prepared_run / "prepared"
+        images = prepared / "images" / "source-000"
+        images.mkdir(parents=True)
+        train_samples = []
+        validation_samples = []
+        prompt = finetune_vl.prompt_for_task(task)
+        if task == "ocr":
+            targets = [f"{name}-train-{index}" for index in range(train_count)]
+            validation_targets = [
+                f"{name}-validation-{index}" for index in range(validation_count)
+            ]
+        elif task == "table":
+            targets = ["<fcel>header<ecel><nl>"] * train_count
+            validation_targets = ["<fcel>header<ecel><nl>"] * validation_count
+        else:
+            raise AssertionError(f"unsupported fixture task: {task}")
+        for split, count, samples, target_values in (
+            ("train", train_count, train_samples, targets),
+            ("validation", validation_count, validation_samples, validation_targets),
+        ):
+            for index in range(count):
+                filename = f"{split}-{index}.png"
+                (images / filename).write_bytes(png_bytes())
+                samples.append(
+                    finetune_vl.PreparedSample(
+                        f"images/source-000/{filename}", target_values[index], 0, prompt
+                    )
+                )
+        train_jsonl = prepared / "train-source-000.jsonl"
+        validation_jsonl = prepared / "validation-source-000.jsonl"
+        finetune_vl.write_erniekit_jsonl(train_jsonl, train_samples)
+        finetune_vl.write_erniekit_jsonl(validation_jsonl, validation_samples)
+        summary = {
+            "task": task,
+            "prompt": prompt,
+            "model": model,
+            "sources": [
+                {
+                    "dataset": f"/data/{name}",
+                    "train_samples": train_count,
+                    "validation_samples": validation_count,
+                    "train_jsonl": "prepared/train-source-000.jsonl",
+                    "validation_jsonl": "prepared/validation-source-000.jsonl",
+                }
+            ],
+            "train_samples": train_count,
+            "validation_samples": validation_count,
+            "train_probabilities": [1.0],
+            "validation_probabilities": [1.0],
+            "rejected": {},
+        }
+        (prepared_run / "summary.json").write_text(
+            json.dumps(summary), encoding="utf-8"
+        )
+        return prepared_run
+
+    def test_prepared_from_supports_single_and_multiple_paths_and_weights(self):
+        single = finetune_vl.parse_args(["--prepared-from", "/one"])
+        self.assertIsInstance(single.prepared_from, Path)
+        self.assertIsNone(single.prepared_weight)
+        multiple = finetune_vl.parse_args(
+            ["--prepared-from", "/one", "/two", "--prepared-weight", "95", "5"]
+        )
+        self.assertEqual(multiple.prepared_from, [Path("/one"), Path("/two")])
+        self.assertEqual(multiple.prepared_weight, [95.0, 5.0])
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runs = [root / "one", root / "two"]
+            for run in runs:
+                run.mkdir()
+            args = finetune_vl.parse_args(
+                [
+                    "--prepared-from",
+                    *(str(run) for run in runs),
+                    "--prepared-weight",
+                    "95",
+                    "5",
+                ]
+            )
+            with (
+                patch.object(finetune_vl, "validate_erniekit_source"),
+                patch.object(
+                    finetune_vl,
+                    "require_local_model_snapshot",
+                    return_value=Path("/models/PaddleOCR-VL-1.6"),
+                ),
+            ):
+                args.erniekit_dir = root / "erniekit"
+                finetune_vl.validate_args(args)
+            self.assertEqual(args.prepared_weight, [0.95, 0.05])
+
+    def test_prepared_weight_validation_rejects_missing_mismatch_and_nonpositive(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            first = root / "one"
+            second = root / "two"
+            first.mkdir()
+            second.mkdir()
+            cases = (
+                ([str(first), str(second)], None, "require one"),
+                ([str(first), str(second)], [1.0], "one value"),
+                ([str(first), str(second)], [0.0, 1.0], "positive"),
+                ([str(first), str(second)], [-1.0, 1.0], "positive"),
+                ([str(first), str(second)], [float("nan"), 1.0], "positive"),
+                ([str(first), str(second)], [float("inf"), 1.0], "positive"),
+            )
+            for paths, weights, message in cases:
+                args = finetune_vl.parse_args(["--prepared-from", *paths])
+                args.prepared_weight = weights
+                with self.subTest(weights=weights):
+                    with self.assertRaisesRegex(ValueError, message):
+                        finetune_vl.validate_args(args)
+
+    def test_single_prepared_weight_defaults_and_normalizes_to_one(self):
+        prepared = Path("/one")
+        self.assertEqual(
+            finetune_vl.normalize_prepared_weights([prepared], None), [1.0]
+        )
+        self.assertEqual(
+            finetune_vl.normalize_prepared_weights([prepared], [95.0]), [1.0]
+        )
+
+    def test_aggregate_prepared_runs_scales_probabilities_and_unions_tasks(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            ocr = self._write_prepared_fixture(root, "ocr", train_count=2)
+            table = self._write_prepared_fixture(
+                root, "table", task="table", train_count=1
+            )
+            work_dir = root / "aggregate"
+            summary = finetune_vl.aggregate_prepared_runs(
+                [ocr, table], [95, 5], work_dir
+            )
+
+            self.assertEqual(summary["train_samples"], 3)
+            self.assertEqual(summary["validation_samples"], 2)
+            self.assertEqual(summary["sources"][0]["dataset"], "/data/ocr")
+            self.assertEqual(summary["sources"][1]["dataset"], "/data/table")
+            self.assertEqual(summary["train_probabilities"], [0.95, 0.05])
+            self.assertEqual(summary["validation_probabilities"], [0.95, 0.05])
+            self.assertEqual(summary["tasks"], ["ocr", "table"])
+            self.assertEqual(summary["prepared_from_runs"], [str(ocr.resolve()), str(table.resolve())])
+            self.assertEqual(summary["prepared_weights"], [0.95, 0.05])
+            self.assertEqual(summary["prepared_weight_policy"], "relative_normalized")
+            self.assertFalse((work_dir / "prepared").exists())
+            self.assertEqual(
+                yaml.safe_load((work_dir / "summary.json").read_text()), summary
+            )
+
+    def test_aggregate_preserves_internal_source_probabilities(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            first = self._write_prepared_fixture(root, "first")
+            second = self._write_prepared_fixture(root, "second")
+            first_summary_path = first / "summary.json"
+            first_summary = json.loads(first_summary_path.read_text())
+            first_source = first_summary["sources"][0]
+            duplicate = dict(first_source)
+            duplicate["dataset"] = "/data/first-secondary"
+            first_summary["sources"].append(duplicate)
+            first_summary["train_samples"] = 2
+            first_summary["validation_samples"] = 2
+            first_summary["train_probabilities"] = [0.75, 0.25]
+            first_summary["validation_probabilities"] = [0.6, 0.4]
+            first_summary_path.write_text(json.dumps(first_summary))
+
+            summary = finetune_vl.load_prepared_runs(
+                [first, second], [3, 1], root / "aggregate"
+            )
+
+            self.assertEqual(summary["prepared_weights"], [0.75, 0.25])
+            self.assertEqual(
+                summary["train_probabilities"], [0.5625, 0.1875, 0.25]
+            )
+            self.assertEqual(len(summary["validation_probabilities"]), 3)
+            for actual, expected in zip(
+                summary["validation_probabilities"], [0.45, 0.3, 0.25], strict=True
+            ):
+                self.assertAlmostEqual(actual, expected)
+
+    def test_aggregate_resolved_config_flattens_all_sources(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            first = self._write_prepared_fixture(root, "first")
+            second = self._write_prepared_fixture(root, "second")
+            summary = finetune_vl.load_prepared_runs(
+                [first, second], [95, 5], root / "aggregate"
+            )
+            args = argparse.Namespace(
+                model="PaddlePaddle/PaddleOCR-VL-1.6",
+                epochs=1,
+                learning_rate=1e-4,
+                lora_rank=32,
+                min_pixels=50_176,
+                max_pixels=451_584,
+                max_seq_len=2048,
+                gradient_accumulation_steps=16,
+                num_workers=2,
+                prefetch_factor=2,
+                seed=2026,
+                flash_attention=True,
+                devices="0",
+                save_steps=1,
+                smoke_steps=None,
+                resume_from=None,
+            )
+            config = finetune_vl.create_resolved_config(
+                root / "aggregate" / "resolved.yaml",
+                root / "aggregate",
+                summary,
+                args,
+            )
+
+            self.assertEqual(
+                config["train_dataset_path"],
+                ",".join(source["train_jsonl"] for source in summary["sources"]),
+            )
+            self.assertEqual(config["train_dataset_prob"], "0.95,0.05")
+            self.assertEqual(config["eval_dataset_prob"], "0.95,0.05")
+
+    def test_prepared_jsonl_rejects_invalid_prompt_and_target_schema(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            prepared_run = self._write_prepared_fixture(root, "table", task="table")
+            train_jsonl = prepared_run / "prepared" / "train-source-000.jsonl"
+            payload = json.loads(train_jsonl.read_text())
+            payload["text_info"][0]["text"] = "OCR:"
+            train_jsonl.write_text(json.dumps(payload) + "\n")
+            with self.assertRaisesRegex(ValueError, "task mask contract"):
+                finetune_vl.read_prepared_run(prepared_run)
+
+            payload["text_info"][0]["text"] = "Table Recognition:"
+            payload["text_info"][1]["text"] = "<table><tr><td>x</td></tr></table>"
+            train_jsonl.write_text(json.dumps(payload) + "\n")
+            with self.assertRaisesRegex(ValueError, "target schema"):
+                finetune_vl.read_prepared_run(prepared_run)
+
+    def test_aggregate_prepared_runs_rejects_different_models(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            first = self._write_prepared_fixture(root, "one")
+            second = self._write_prepared_fixture(root, "two", model="other-model")
+            with self.assertRaisesRegex(ValueError, "different base models"):
+                finetune_vl.aggregate_prepared_runs(
+                    [first, second], [0.5, 0.5], root / "aggregate"
+                )
+
     def test_load_prepared_run_validates_jsonl_and_images(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
