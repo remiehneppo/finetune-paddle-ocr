@@ -24,14 +24,31 @@ python -m pip install -U pip
 python -m pip install -r requirements-vl-prepare.txt
 ```
 
-Môi trường GPU để train nên được tạo trong checkout ERNIEKit `release/v1.5`
-theo [hướng dẫn SFT chính thức](https://github.com/PaddlePaddle/ERNIE/blob/release/v1.5/docs/paddleocr_vl_sft.md).
-Với RTX 50/SM120, dùng Paddle CUDA 12.9 theo
-[hướng dẫn Blackwell của PaddleOCR](https://www.paddleocr.ai/main/en/version3.x/pipeline_usage/PaddleOCR-VL-NVIDIA-Blackwell.html),
-checkout ERNIEKit ở revision ghi trong `requirements-vl-erniekit.txt`, rồi cài
-đúng các version runtime trong file đó và `pip install -e .`. Script fail-fast nếu
-Git revision hoặc Paddle/PaddleFormers/Transformers lệch profile đã pin. Script ưu tiên `<erniekit-dir>/.venv/bin/python`, rồi
-`<erniekit-dir>/venv/bin/python`; nếu không có, nó dùng Python đang chạy.
+Môi trường GPU để train yêu cầu checkout ERNIEKit `release/v1.5` tại đúng commit đã được pin trong `requirements-vl-erniekit.txt`.
+
+Các bước cài đặt chuẩn cho ERNIEKit runtime:
+
+```bash
+# 1. Clone ERNIEKit và checkout đúng revision đã xác minh (branch release/v1.5)
+git clone https://github.com/PaddlePaddle/ERNIE.git /path/to/erniekit
+cd /path/to/erniekit
+git checkout 790a50b045d1aca2753d5395d8bec0806b2e6925
+
+# 2. Tạo virtualenv chuyên dụng cho GPU (Python 3.10 - 3.12)
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -U pip
+
+# 3. Cài đặt các thư viện theo phiên bản ghim cố định
+# Đối với CUDA 12.9 (RTX 50 / SM120):
+pip install paddlepaddle-gpu==3.2.1 -i https://www.paddlepaddle.org.cn/packages/stable/cu129/
+# (Hoặc thay bằng cu126 nếu hệ thống dùng CUDA 12.6)
+
+pip install paddleformers==0.4.0 safetensors==0.7.0 transformers==4.55.4 ml_dtypes==0.5.4
+pip install -e .
+```
+
+Script fail-fast nếu Git revision lệch `790a50b045d1aca2753d5395d8bec0806b2e6925` hoặc phiên bản Paddle/PaddleFormers/Transformers không khớp danh sách trên. Script tự động ưu tiên nạp Python tại `<erniekit-dir>/.venv/bin/python`, rồi `<erniekit-dir>/venv/bin/python`.
 
 ## Model
 
@@ -378,6 +395,8 @@ $ERNIEKIT_DIR/.venv/bin/python finetune_vl.py \
 Kiểm tra `metrics/trainable_parameters.json`; adapter không được có tensor
 vision và vision encoder phải frozen.
 
+*Lưu ý về cảnh báo khi inspect:* ERNIEKit v1.5 ở chế độ dry-run (`do_train=false`) sẽ ném log `AttributeError: 'FinetuningArguments' object has no attribute 'is_train_mm'`. Script đã bắt ngoại lệ này, ghi nhận cảnh báo và lưu đầy đủ thông số LoRA vào `metrics/trainable_parameters.json`.
+
 ### 3. Smoke ba bước
 
 ```bash
@@ -422,6 +441,28 @@ $ERNIEKIT_DIR/.venv/bin/python finetune_vl.py \
 Đây là overfit/feasibility pilot. Nếu validation chỉ có một table crop và không
 có OCR crop, evaluator chỉ chứng minh pipeline hoạt động; không đủ để kết luận
 model tốt hơn base.
+
+### 5. Mẹo huấn luyện hiệu quả và xử lý các tình huống thực tế
+
+#### Tránh lỗi Sequence quá dài làm bỏ qua dữ liệu (ValueError / AssertionError: result: 0, [])
+- Khi gán nhãn dữ liệu bảng biểu (`table`) hoặc văn bản có nhiều dòng, một ảnh crop có thể cần ~1.200 visual tokens và hơn 1.000 text tokens (tổng > 2.048 tokens).
+- Nếu không khai báo tham số, `finetune_vl.py` mặc định dùng `--max-seq-len 2048`. ERNIEKit sẽ báo lỗi `ValueError: The data is too long and cannot be truncated` và tự động **bỏ qua (skip)** các mẫu này trong lúc train.
+- **Quy tắc:** Luôn truyền `--max-pixels 250880 --max-seq-len 4096` trong mọi lệnh smoke và pilot. `--max-pixels 250880` giúp thu nhỏ grid ảnh của crop xuống ~320 tokens (vừa tiết kiệm VRAM vừa đọc chi tiết tốt), còn `--max-seq-len 4096` đảm bảo các bảng biểu phức tạp không bị cắt cụt.
+
+#### Xử lý khi Quality Gate so sánh với Base Model báo lỗi
+- Pipeline mặc định so sánh CER/NED của model sau train với model gốc. Nếu tập validation có quá ít mẫu (ví dụ chỉ 1 crop bảng duy nhất), bất kỳ sự thay đổi nhỏ nào khiến CER tăng 0.04% cũng sẽ làm fail quality gate (`RuntimeError: No adapter checkpoint passed the native OCR quality gate`).
+- Để xuất model trong các lượt chạy thử nghiệm / pilot:
+  1. Thêm `--skip-evaluation` trực tiếp vào lệnh train.
+  2. Hoặc nếu training đã hoàn tất lưu adapter tại `$WORK_DIR/adapter`, xuất model bằng script merge thủ công:
+     ```bash
+     python merge_paddleocr_vl_lora.py \
+       --base-model "$VL_MODEL" \
+       --adapter-dir "$WORK_DIR/adapter" \
+       --output-dir "$WORK_DIR/adapter/export" \
+       --fixture-jsonl "$FIXTURE_JSONL" \
+       --min-pixels 50176 \
+       --max-pixels 451584
+     ```
 
 ## Tham số `finetune_vl.py`
 

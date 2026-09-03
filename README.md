@@ -519,6 +519,29 @@ Tài liệu cài đặt/runtime chuyên sâu:
 [docs/finetune-paddleocr-vl-1.6.md](docs/finetune-paddleocr-vl-1.6.md).
 Pipeline này dùng ERNIEKit release/v1.5, không dùng `PaddleOCR/tools/train.py`.
 
+#### Cài đặt ERNIEKit runtime chuẩn
+
+Pipeline kiểm tra nghiêm ngặt git commit và version runtime của ERNIEKit để đảm bảo tương thích LoRA decoder-only. Cài đặt vào thư mục riêng:
+
+```bash
+# 1. Clone ERNIEKit và checkout đúng commit đã pin (branch release/v1.5)
+git clone https://github.com/PaddlePaddle/ERNIE.git erniekit
+cd erniekit
+git checkout 790a50b045d1aca2753d5395d8bec0806b2e6925
+
+# 2. Tạo virtualenv Python 3.10-3.12 (khuyến nghị 3.11 hoặc 3.12)
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -U pip
+
+# 3. Cài đặt các gói đúng phiên bản đã pin trong requirements-vl-erniekit.txt
+pip install paddlepaddle-gpu==3.2.1 -i https://www.paddlepaddle.org.cn/packages/stable/cu129/  # hoặc cu126
+pip install paddleformers==0.4.0 safetensors==0.7.0 transformers==4.55.4 ml_dtypes==0.5.4
+pip install -e .
+```
+
+Thư mục virtualenv này sẽ là `$ERNIEKIT_DIR/.venv`.
+
 #### Dataset và task contract
 
 Dataset labeler chuẩn có split `train`/`validation` và các cột `image`, `text`,
@@ -581,6 +604,8 @@ $ERNIEKIT_DIR/.venv/bin/python finetune_vl.py \
 Inspect phải xác nhận LoRA chỉ ở text decoder, vision frozen và không có adapter
 tensor thuộc vision encoder.
 
+*Lưu ý:* Khi chạy `--inspect-model`, nếu thấy log `AttributeError: 'FinetuningArguments' object has no attribute 'is_train_mm'` và cảnh báo của script, đây là hành vi dry-run bình thường của ERNIEKit v1.5; script đã bắt exception và lưu `metrics/trainable_parameters.json` thành công.
+
 #### Bước 3: smoke test
 
 ```bash
@@ -625,6 +650,26 @@ $ERNIEKIT_DIR/.venv/bin/python finetune_vl.py \
 
 Với chỉ `35` train samples, đây là feasibility/overfit pilot. Cần validation có
 nhiều OCR và table crop trước khi dùng metric để kết luận chất lượng.
+
+#### Mẹo huấn luyện hiệu quả và xử lý lỗi thường gặp
+
+1. **Tránh bị bỏ qua mẫu bảng/văn bản dài (Data Dropping/Skipping)**:
+   - Khi dataset có mẫu bảng (`table`) hoặc OCR văn bản nhiều dòng, tổng token biểu diễn ảnh và text/OTSL có thể vượt 2.048. Nếu để `--max-seq-len 2048` mặc định, ERNIEKit sẽ báo lỗi `ValueError: The data is too long and cannot be truncated` và âm thầm bỏ qua mẫu đó trong lúc train.
+   - **Luôn truyền:** `--max-pixels 250880 --max-seq-len 4096` trong lệnh train để thu gọn token ảnh của crop và mở rộng context window.
+
+2. **Xử lý Quality Gate khi tập validation nhỏ**:
+   - Nếu tập validation chỉ có 1–2 mẫu, chỉ cần lệch 1 ký tự là CER tăng nhẹ và Quality Gate (`no_regression_vs_base: true`) sẽ chặn tạo model merge (`RuntimeError: No adapter checkpoint passed the native OCR quality gate`).
+   - **Giải pháp A:** Thêm cờ `--skip-evaluation` vào lệnh `finetune_vl.py` khi train thử nghiệm/pilot.
+   - **Giải pháp B:** Nếu đã train xong adapter tại `$WORK_DIR/adapter`, dùng script merge trực tiếp:
+     ```bash
+     python merge_paddleocr_vl_lora.py \
+       --base-model "$VL_MODEL" \
+       --adapter-dir "$WORK_DIR/adapter" \
+       --output-dir "$WORK_DIR/export" \
+       --fixture-jsonl "$FIXTURE" \
+       --min-pixels 50176 \
+       --max-pixels 451584
+     ```
 
 #### Bước 5: resume
 
