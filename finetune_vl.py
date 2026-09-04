@@ -29,6 +29,7 @@ import yaml
 from PIL import Image, UnidentifiedImageError
 
 import finetune as rec_loader
+from prepared_run_planning import PreparedRunPlanner
 from paddleocr_vl_tasks import (
     TASK_PROMPTS,
     prompt_for_task,
@@ -1005,78 +1006,12 @@ def aggregate_prepared_runs(
     prepared_weights: Sequence[float] | None,
     work_dir: Path,
 ) -> dict[str, Any]:
-    normalized_weights = normalize_prepared_weights(prepared_from, prepared_weights)
-    run_summaries = [read_prepared_run(path) for path in prepared_from]
-    models = [summary.get("model") for summary in run_summaries]
-    if any(not isinstance(model, str) or not model for model in models):
-        raise ValueError("Every prepared summary must record a non-empty model")
-    if len(set(models)) != 1:
-        raise ValueError(f"Prepared runs use different base models: {models}")
-
-    sources: list[dict[str, Any]] = []
-    train_probabilities: list[float] = []
-    validation_probabilities: list[float] = []
-    tasks: set[str] = set()
-    source_runs: list[str] = []
-    rejected: Counter[str] = Counter()
-    for run_summary, run_weight in zip(
-        run_summaries, normalized_weights, strict=True
-    ):
-        run_path = run_summary["prepared_from"]
-        run_sources = run_summary["sources"]
-        sources.extend(run_sources)
-        source_runs.extend(run_path for _ in run_sources)
-        train_probabilities.extend(
-            run_weight * value for value in run_summary["train_probabilities"]
-        )
-        validation_probabilities.extend(
-            run_weight * value for value in run_summary["validation_probabilities"]
-        )
-        tasks.update(run_summary["tasks"])
-        run_rejected = run_summary.get("rejected", {})
-        if isinstance(run_rejected, Mapping):
-            rejected.update(
-                {
-                    str(reason): count
-                    for reason, count in run_rejected.items()
-                    if isinstance(count, int)
-                }
-            )
-
-    for field, probabilities in (
-        ("train_probabilities", train_probabilities),
-        ("validation_probabilities", validation_probabilities),
-    ):
-        if not math.isclose(sum(probabilities), 1.0, rel_tol=1e-6, abs_tol=1e-6):
-            raise ValueError(f"Aggregated {field} does not sum to 1.0")
-
-    ordered_tasks = sorted(tasks)
-    summary: dict[str, Any] = {
-        "task": ordered_tasks[0] if len(ordered_tasks) == 1 else "mixed",
-        "tasks": ordered_tasks,
-        "prompts": [prompt_for_task(task) for task in ordered_tasks],
-        "model": models[0],
-        "sources": sources,
-        "source_runs": source_runs,
-        "train_samples": sum(summary["train_samples"] for summary in run_summaries),
-        "validation_samples": sum(
-            summary["validation_samples"] for summary in run_summaries
-        ),
-        "train_probabilities": train_probabilities,
-        "validation_probabilities": validation_probabilities,
-        "prepared_from_runs": [summary["prepared_from"] for summary in run_summaries],
-        "prepared_weights": normalized_weights,
-        "prepared_weight_policy": "relative_normalized",
-        "rejected": dict(sorted(rejected.items())),
-    }
-    if len(ordered_tasks) == 1:
-        summary["prompt"] = prompt_for_task(ordered_tasks[0])
-
-    work_dir.mkdir(parents=True, exist_ok=True)
-    (work_dir / "summary.json").write_text(
-        json.dumps(summary, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
-    )
-    return summary
+    plan = PreparedRunPlanner(
+        read_run=read_prepared_run,
+        normalize_weights=normalize_prepared_weights,
+        prompt_for_task=prompt_for_task,
+    ).plan(prepared_from, prepared_weights)
+    return plan.write_summary(work_dir)
 
 
 def load_prepared_runs(
@@ -1087,19 +1022,12 @@ def load_prepared_runs(
     prepared_runs = (
         [prepared_from] if isinstance(prepared_from, Path) else list(prepared_from)
     )
-    weights = normalize_prepared_weights(prepared_runs, prepared_weights)
-    if len(prepared_runs) == 1:
-        summary = read_prepared_run(prepared_runs[0])
-        summary["prepared_weights"] = weights
-        summary["prepared_weight_policy"] = "relative_normalized"
-        summary["source_runs"] = [summary["prepared_from"]] * len(summary["sources"])
-        work_dir.mkdir(parents=True, exist_ok=True)
-        (work_dir / "summary.json").write_text(
-            json.dumps(summary, ensure_ascii=False, indent=2) + "\n",
-            encoding="utf-8",
-        )
-        return summary
-    return aggregate_prepared_runs(prepared_runs, prepared_weights, work_dir)
+    plan = PreparedRunPlanner(
+        read_run=read_prepared_run,
+        normalize_weights=normalize_prepared_weights,
+        prompt_for_task=prompt_for_task,
+    ).plan(prepared_runs, prepared_weights)
+    return plan.write_summary(work_dir)
 
 
 def load_prepared_run(prepared_from: Path, work_dir: Path) -> dict[str, Any]:

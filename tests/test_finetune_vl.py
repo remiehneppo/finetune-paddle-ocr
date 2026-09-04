@@ -18,6 +18,7 @@ from PIL import Image
 import evaluate_paddleocr_vl
 import finetune_vl
 import merge_paddleocr_vl_lora
+from prepared_run_planning import PreparedRunPlan, PreparedRunPlanner
 
 
 class FakeSplit:
@@ -200,6 +201,65 @@ class FinetuneVLTests(unittest.TestCase):
         self.assertEqual(
             finetune_vl.normalize_prepared_weights([prepared], [95.0]), [1.0]
         )
+
+    def test_prepared_run_plan_is_immutable_and_round_trips_metadata(self):
+        source = {
+            "dataset": "/data/one",
+            "train_samples": 1,
+            "tags": ["trusted"],
+        }
+        plan = PreparedRunPlan.from_summary(
+            {
+                "model": "model",
+                "prepared_from": "/runs/one",
+                "tasks": ["ocr"],
+                "prompts": [finetune_vl.prompt_for_task("ocr")],
+                "sources": [source],
+                "source_runs": ["/runs/one"],
+                "train_samples": 1,
+                "validation_samples": 1,
+                "train_probabilities": [1.0],
+                "validation_probabilities": [1.0],
+                "prepared_from_runs": ["/runs/one"],
+                "prepared_weights": [1.0],
+                "rejected": {},
+                "custom_metadata": {"producer": "legacy"},
+            }
+        )
+
+        source["dataset"] = "/data/mutated"
+        source["tags"].append("mutated")
+        self.assertEqual(plan.sources[0]["dataset"], "/data/one")
+        self.assertEqual(plan.sources[0]["tags"], ("trusted",))
+        with self.assertRaises((AttributeError, TypeError)):
+            plan.tasks = ("table",)
+        self.assertEqual(plan.to_summary()["prepared_from"], "/runs/one")
+        self.assertEqual(
+            plan.to_summary()["custom_metadata"], {"producer": "legacy"}
+        )
+
+    def test_prepared_run_planner_keeps_single_run_compatibility(self):
+        prepared = Path("/runs/one")
+        planner = PreparedRunPlanner(
+            read_run=lambda path: {
+                "model": "model",
+                "prepared_from": str(path),
+                "tasks": ["ocr"],
+                "prompts": [finetune_vl.prompt_for_task("ocr")],
+                "sources": [{"dataset": "/data/one"}],
+                "train_samples": 1,
+                "validation_samples": 1,
+                "train_probabilities": [1.0],
+                "validation_probabilities": [1.0],
+            },
+            normalize_weights=finetune_vl.normalize_prepared_weights,
+            prompt_for_task=finetune_vl.prompt_for_task,
+        )
+
+        summary = planner.plan([prepared], None).to_summary()
+        self.assertEqual(summary["prepared_from"], str(prepared))
+        self.assertEqual(summary["prepared_from_runs"], [str(prepared)])
+        self.assertEqual(summary["source_runs"], [str(prepared)])
 
     def test_aggregate_prepared_runs_scales_probabilities_and_unions_tasks(self):
         with tempfile.TemporaryDirectory() as directory:

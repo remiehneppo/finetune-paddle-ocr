@@ -236,6 +236,43 @@ Run mới chỉ chứa `summary.json`, `resolved.yaml`, checkpoint, log và metr
 không có bản sao `prepared/`. Không kết hợp `--prepared-from` với
 `--dataset-dir`, `--prepare-only` hoặc `--resume-from`.
 
+### Kiến trúc planning và phạm vi thay đổi
+
+Có ba lớp cần phân biệt để tránh nhầm giữa giao diện sử dụng và implementation:
+
+1. **CLI và contract người dùng:** `--prepared-from`/`--prepared-weight` nằm
+   trong `finetune_vl.py`. Single-run vẫn tương thích; multi-run yêu cầu weight
+   dương, hữu hạn, đúng số lượng và tự normalize.
+2. **Validation adapter:** `finetune_vl.py` vẫn validate summary, JSONL,
+   image reference, prompt mask và target schema. Planner không bỏ qua các gate
+   này và không tự suy luận lại target contract.
+3. **Planning module:** `prepared_run_planning.py` tạo `PreparedRunPlan` bất
+   biến và `PreparedRunPlanner` để hợp nhất các summary đã validate. Module này
+   chỉ lập kế hoạch GPU-independent; nó không chạy ERNIEKit, không load model,
+   không train và không đánh giá quality.
+
+`PreparedRunPlan` giữ model identity, task/prompt union, source order,
+provenance, sample counts, train/validation probabilities, normalized weights
+và rejection metadata. Các source path vẫn trỏ về prepared run gốc; planner
+không tạo bản sao `prepared/`. Metadata mở rộng trong summary legacy cũng được
+giữ lại khi serialize.
+
+`aggregate_prepared_runs()` và `load_prepared_runs()` trong `finetune_vl.py`
+vẫn được giữ làm compatibility wrappers. Vì vậy đây là refactor nội bộ, không
+phải một workflow CLI mới. Config cuối vẫn được tạo bởi
+`create_resolved_config()` và đi vào backend ERNIEKit như trước.
+
+Verification của phần planning:
+
+```text
+.venv-vl-eval/bin/python -m pytest -q tests/test_finetune_vl.py
+67 passed, 1 skipped
+```
+
+Kết quả trên chỉ xác nhận contract/planning và regression tests. Nó không phải
+là bằng chứng đã chạy full training GPU, native evaluation hoặc chứng minh
+quality của model.
+
 ## Inspect và GPU smoke test
 
 Trước mọi lần train, script chạy preflight `do_train=false`: model được wrap

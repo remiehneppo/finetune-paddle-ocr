@@ -10,6 +10,27 @@ OCR/table/formula/chart dùng chung
 `finetune_vl.py`; trộn nhiều layout trong một run qua cột `task` trong dataset
 để hạn chế phá các khả năng layout khác.
 
+### Phân biệt CLI và kiến trúc prepared-run
+
+`--prepared-from` và `--prepared-weight` là CLI dành cho người dùng. Phần
+planning nội bộ tương ứng được đặt trong `prepared_run_planning.py`: module này
+đọc các prepared summary đã được validate, tạo `PreparedRunPlan` bất biến và
+ghi `summary.json` cho run mới. `finetune_vl.py` vẫn giữ các hàm tương thích và
+tiếp tục sở hữu validation target/prompt; refactor này không tạo thêm CLI và
+không thay đổi backend ERNIEKit.
+
+Luồng thực tế là:
+
+1. `finetune_vl.py` validate summary, JSONL, prompt/target contract và ảnh.
+2. `PreparedRunPlanner` hợp nhất một hoặc nhiều run, kiểm tra model, union
+   task, normalize weight và giữ provenance/source path.
+3. `create_resolved_config()` chuyển summary đã lập kế hoạch thành config
+   ERNIEKit; JSONL và ảnh vẫn được tham chiếu tại run nguồn, không được copy.
+
+Đã kiểm chứng bằng `.venv-vl-eval`: `67 passed, 1 skipped` trong
+`tests/test_finetune_vl.py`. Test còn lại bị skip là kiểm thử phụ thuộc môi
+trường; không dùng kết quả này để khẳng định training GPU hoặc quality model.
+
 Với nhiều dataset VL thiếu cột `task`, phải khai báo `--dataset-task` theo đúng
 thứ tự source. Table target phải là OTSL, formula là LaTeX, chart là Markdown;
 OCR giữ nguyên newline. Pipeline tính image token theo `smart_resize` thật và
