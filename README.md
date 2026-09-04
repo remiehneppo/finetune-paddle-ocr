@@ -564,11 +564,13 @@ Không dùng `--dataset-dir` và `--prepared-from` cùng lúc.
 python finetune_vl.py \
   --dataset-dir /path/to/export/vl \
   --model "$VL_MODEL" \
+  --max-pixels 250880 \
+  --max-seq-len 4096 \
   --work-dir "$OUTPUT_ROOT/vl_prepare" \
   --prepare-only
 ```
 
-Prepare-only không cần ERNIEKit và không load model. Giữ nguyên prepared run vì
+Prepare-only không cần ERNIEKit hoặc GPU train; script vẫn load tokenizer từ `--model` để tính token budget. Giữ nguyên prepared run vì
 `--prepared-from` tham chiếu trực tiếp JSONL/ảnh, không copy lại. Khi cần trộn
 prepared corpus cũ với export labeler mới, truyền nhiều run và weight tương ứng:
 
@@ -596,8 +598,6 @@ $ERNIEKIT_DIR/.venv/bin/python finetune_vl.py \
   --model "$VL_MODEL" \
   --work-dir "$OUTPUT_ROOT/vl_inspect" \
   --inspect-model \
-  --gradient-accumulation-steps 16 \
-  --eval-samples-per-dataset 4 \
   --devices 0
 ```
 
@@ -616,8 +616,7 @@ $ERNIEKIT_DIR/.venv/bin/python finetune_vl.py \
   --model "$VL_MODEL" \
   --work-dir "$OUTPUT_ROOT/vl_smoke" \
   --smoke-steps 3 \
-  --gradient-accumulation-steps 16 \
-  --eval-samples-per-dataset 4 \
+  --gradient-accumulation-steps 32 \
   --max-pixels 250880 \
   --max-seq-len 4096 \
   --devices 0
@@ -639,7 +638,7 @@ $ERNIEKIT_DIR/.venv/bin/python finetune_vl.py \
   --epochs 30 \
   --learning-rate 1e-4 \
   --lora-rank 32 \
-  --gradient-accumulation-steps 16 \
+  --gradient-accumulation-steps 32 \
   --save-steps 10 \
   --eval-samples-per-dataset 4 \
   --eval-max-checkpoints 3 \
@@ -653,9 +652,9 @@ nhiều OCR và table crop trước khi dùng metric để kết luận chất l
 
 #### Mẹo huấn luyện hiệu quả và xử lý lỗi thường gặp
 
-1. **Tránh bị bỏ qua mẫu bảng/văn bản dài (Data Dropping/Skipping)**:
-   - Khi dataset có mẫu bảng (`table`) hoặc OCR văn bản nhiều dòng, tổng token biểu diễn ảnh và text/OTSL có thể vượt 2.048. Nếu để `--max-seq-len 2048` mặc định, ERNIEKit sẽ báo lỗi `ValueError: The data is too long and cannot be truncated` và âm thầm bỏ qua mẫu đó trong lúc train.
-   - **Luôn truyền:** `--max-pixels 250880 --max-seq-len 4096` trong lệnh train để thu gọn token ảnh của crop và mở rộng context window.
+1. **Tránh mất sample vì token budget**:
+   - `finetune_vl.py` tính token budget ngay trong bước prepare. Sample vượt `--max-seq-len` bị reject với reason `token_budget_exceeded` và ghi vào `rejected.jsonl`; target không bị truncate.
+   - Nếu dataset có bảng hoặc OCR nhiều dòng, truyền `--max-pixels 250880 --max-seq-len 4096` ngay ở lệnh `--prepare-only`. Đổi các cờ này sau đó ở lệnh train không khôi phục sample đã bị reject; cần prepare lại từ raw dataset.
 
 2. **Xử lý Quality Gate khi tập validation nhỏ**:
    - Nếu tập validation chỉ có 1–2 mẫu, chỉ cần lệch 1 ký tự là CER tăng nhẹ và Quality Gate (`no_regression_vs_base: true`) sẽ chặn tạo model merge (`RuntimeError: No adapter checkpoint passed the native OCR quality gate`).

@@ -84,21 +84,26 @@ nhiều loại trong một run. Với một nguồn thiếu cột này, dùng `-
 `ocr`). Với nhiều nguồn có nguồn thiếu `task`, bắt buộc truyền một
 `--dataset-task` cho mỗi `--dataset-dir`; script không âm thầm gán tất cả nguồn
 thành OCR. Target giữ nguyên newline cho cả OCR và layout. Ảnh phải giải mã
-thật, có hai chiều lớn hơn 1 pixel, nằm dưới
-`--max-image-pixels`, và được materialize thành PNG RGB.
+thật, có hai chiều lớn hơn 1 pixel, nằm dưới `--max-image-pixels`, được
+materialize thành PNG RGB và phải fit token budget. Sample không fit bị loại ở
+bước prepare và ghi vào `rejected.jsonl`, không bị âm thầm bỏ qua trong lúc train.
 
 ```bash
 python finetune_vl.py \
   --dataset-dir /data/ocr_a /data/ocr_b \
   --dataset-task ocr ocr \
   --model "$MODEL" \
+  --max-pixels 250880 \
+  --max-seq-len 4096 \
   --work-dir runs/vl16_vi_prepare \
   --prepare-only
 ```
 
 Mỗi nguồn giữ validation riêng. Nếu nguồn chưa có `validation`, `valid` hoặc
 `dev`, script tách holdout với seed riêng cho nguồn. ERNIEKit nhận một JSONL cho
-mỗi nguồn và xác suất trộn chuẩn hóa theo `sqrt(số sample)`.
+mỗi nguồn và xác suất trộn chuẩn hóa theo `sqrt(số sample)`. `--prepare-only`
+không load model weights hoặc chạy train, nhưng vẫn load tokenizer từ `--model`
+để tính token budget; nên truyền snapshot model local nếu muốn prepare offline.
 
 ### Trộn table, formula và chart
 
@@ -111,6 +116,8 @@ khác. Mỗi sample cần cột `task`; JSONL ERNIEKit vẫn đặt ảnh khớp
 python finetune_vl.py \
   --dataset-dir /data/layout_mixed \
   --model "$MODEL" \
+  --max-pixels 250880 \
+  --max-seq-len 4096 \
   --work-dir runs/vl16_layout_mixed_prepare \
   --prepare-only
 
@@ -256,15 +263,16 @@ python finetune_vl.py \
 ```
 
 Profile mặc định: LoRA rank 32, vision encoder đóng băng, BF16/O2,
-FlashAttention, full recompute, micro-batch 1, packing 1, accumulation 16,
+FlashAttention, full recompute, micro-batch 1, packing 1, accumulation 32,
 sequence 2048, `50,176–451,584` pixel, LR `1e-4`, cosine, warmup 3%, weight
 decay `0.01`, 3 epoch, hai worker và prefetch 2. Dùng
 `--no-flash-attention` nếu build/hardware không tương thích.
 
 OCR-VL tạo `IterableDataset` không có độ dài, nên ERNIEKit bắt buộc `max_steps`
-dương. Script tự tính `ceil(samples × epochs / (batch × packing × accumulation))`;
-với 220.691 sample, 2,5 epoch và effective batch 16, config nhận `max_steps: 34483`.
-`--smoke-steps` vẫn override giá trị này cho smoke test.
+dương. Script tự tính
+`ceil(samples × epochs / (micro_batch × packing × accumulation × số GPU))`;
+với micro-batch và packing bằng 1. `--smoke-steps` override giá trị này cho
+smoke test.
 
 Với snapshot Hugging Face chính thức, pipeline bật `use_huggingface_model` để
 LoRA phủ đủ `q/k/v/o/up/gate/down` của decoder. Hook runtime giới hạn regex vào
@@ -290,21 +298,28 @@ python finetune_vl.py \
 
 ## Artifact
 
+Run tạo từ raw dataset có thêm `prepared/` và `rejected.jsonl`; run tạo bằng
+`--prepared-from` chỉ tham chiếu các file của prepared run nguồn và không copy
+chúng vào run mới:
+
 ```text
-runs/vl16_vi_full/
-├── prepared/
+<work-dir>/
+├── prepared/                         # chỉ có khi run này dùng --dataset-dir
 │   ├── images/source-*/
 │   ├── train-source-*.jsonl
 │   └── validation-source-*.jsonl
-├── rejected.jsonl
+├── rejected.jsonl                    # chỉ có khi prepare raw dataset
 ├── summary.json
-├── resolved.yaml
-├── adapter/                 # LoRA + checkpoints ERNIEKit
-│   └── export/              # model đã merge + verification reports
+├── resolved.yaml                     # resolved-resume*.yaml khi resume
+├── adapter/
+│   ├── checkpoint-*/                 # checkpoint ERNIEKit
+│   └── export/                       # merged Hugging Face model
+│       ├── merge_verification.json
+│       └── logits_verification.json
 ├── export.yaml
 ├── export_manifest.json
 ├── logs/
-├── metrics/                 # VRAM, checkpoint selection, CER, predictions
+├── metrics/                           # runtime, selection, CER, predictions
 └── tensorboard_logs/
 ```
 
@@ -333,7 +348,10 @@ nào đạt; smoke run vẫn chọn bản tốt nhất nhưng manifest giữ tr�
 
 Token budget prepare dùng đúng `smart_resize` của PaddleOCR-VL, grid ảnh
 `(H/14)*(W/14)/2^2`, token prompt/response không special token và một EOS. Sample
-vượt `--max-seq-len` bị reject; target không bao giờ bị truncate.
+vượt `--max-seq-len` bị reject trước khi JSONL được tạo; target không bao giờ bị
+truncate. Nếu muốn đổi `--min-pixels`, `--max-pixels` hoặc `--max-seq-len`, phải
+prepare lại từ raw dataset; đổi các cờ này chỉ ở bước train không khôi phục sample
+đã bị loại trong prepared run.
 
 Lưu ý về ERNIEKit `release/v1.5`: workflow `OCR-VL-SFT` chính thức hiện để
 `eval_dataset=None`, nên bật `do_eval` sẽ lỗi thay vì tạo validation loss. Config
@@ -370,6 +388,8 @@ cd "$REPO"
 python finetune_vl.py \
   --dataset-dir "$LABELER_EXPORT" \
   --model "$VL_MODEL" \
+  --max-pixels 250880 \
+  --max-seq-len 4096 \
   --work-dir "$PREPARED" \
   --prepare-only
 ```
@@ -387,8 +407,6 @@ $ERNIEKIT_DIR/.venv/bin/python finetune_vl.py \
   --model "$VL_MODEL" \
   --work-dir "$OUTPUT_ROOT/vl16_vi_experiment/labeler_only_inspect" \
   --inspect-model \
-  --gradient-accumulation-steps 16 \
-  --eval-samples-per-dataset 4 \
   --devices 0
 ```
 
@@ -407,8 +425,7 @@ $ERNIEKIT_DIR/.venv/bin/python finetune_vl.py \
   --model "$VL_MODEL" \
   --work-dir "$OUTPUT_ROOT/vl16_vi_experiment/labeler_only_smoke" \
   --smoke-steps 3 \
-  --gradient-accumulation-steps 16 \
-  --eval-samples-per-dataset 4 \
+  --gradient-accumulation-steps 32 \
   --max-pixels 250880 \
   --max-seq-len 4096 \
   --devices 0
@@ -429,7 +446,7 @@ $ERNIEKIT_DIR/.venv/bin/python finetune_vl.py \
   --epochs 30 \
   --learning-rate 1e-4 \
   --lora-rank 32 \
-  --gradient-accumulation-steps 16 \
+  --gradient-accumulation-steps 32 \
   --save-steps 10 \
   --eval-samples-per-dataset 4 \
   --eval-max-checkpoints 3 \
@@ -444,10 +461,10 @@ model tốt hơn base.
 
 ### 5. Mẹo huấn luyện hiệu quả và xử lý các tình huống thực tế
 
-#### Tránh lỗi Sequence quá dài làm bỏ qua dữ liệu (ValueError / AssertionError: result: 0, [])
-- Khi gán nhãn dữ liệu bảng biểu (`table`) hoặc văn bản có nhiều dòng, một ảnh crop có thể cần ~1.200 visual tokens và hơn 1.000 text tokens (tổng > 2.048 tokens).
-- Nếu không khai báo tham số, `finetune_vl.py` mặc định dùng `--max-seq-len 2048`. ERNIEKit sẽ báo lỗi `ValueError: The data is too long and cannot be truncated` và tự động **bỏ qua (skip)** các mẫu này trong lúc train.
-- **Quy tắc:** Luôn truyền `--max-pixels 250880 --max-seq-len 4096` trong mọi lệnh smoke và pilot. `--max-pixels 250880` giúp thu nhỏ grid ảnh của crop xuống ~320 tokens (vừa tiết kiệm VRAM vừa đọc chi tiết tốt), còn `--max-seq-len 4096` đảm bảo các bảng biểu phức tạp không bị cắt cụt.
+#### Tránh mất sample vì token budget
+- `finetune_vl.py` tính token budget ngay trong bước prepare từ prompt, target và visual tokens sau smart-resize. Sample vượt `--max-seq-len` bị reject với reason `token_budget_exceeded` và ghi chi tiết vào `rejected.jsonl`; ERNIEKit không truncate target.
+- Nếu dataset có bảng hoặc OCR nhiều dòng, đặt `--max-pixels` và `--max-seq-len` ngay ở lệnh `--prepare-only`. Đổi hai cờ này chỉ ở lệnh train không làm sống lại sample đã bị reject; cần prepare lại từ raw dataset.
+- Ví dụ profile nhiều layout: `--max-pixels 250880 --max-seq-len 4096`. Chỉ tăng `--max-seq-len` khi VRAM và độ dài target cho phép; tăng `--max-pixels` cũng làm tăng visual tokens và memory.
 
 #### Xử lý khi Quality Gate so sánh với Base Model báo lỗi
 - Pipeline mặc định so sánh CER/NED của model sau train với model gốc. Nếu tập validation có quá ít mẫu (ví dụ chỉ 1 crop bảng duy nhất), bất kỳ sự thay đổi nhỏ nào khiến CER tăng 0.04% cũng sẽ làm fail quality gate (`RuntimeError: No adapter checkpoint passed the native OCR quality gate`).
@@ -476,7 +493,7 @@ model tốt hơn base.
 | `--erniekit-dir PATH` | Bắt buộc khi không prepare-only | ERNIEKit release/v1.5 checkout đã pin và có runtime Python. |
 | `--model PATH_OR_ID` | `PaddlePaddle/PaddleOCR-VL-1.6` | Base model; inspect/train yêu cầu local snapshot hợp lệ. |
 | `--work-dir PATH` | Timestamp run | Run output mới; resume dùng đúng run cũ. |
-| `--prepare-only` | Tắt | Chỉ validate/stage; không load model hoặc train. |
+| `--prepare-only` | Tắt | Chỉ validate/stage; không cần ERNIEKit/GPU train nhưng vẫn load tokenizer để tính token budget. |
 | `--smoke-steps INT` | Không có | Override `max_steps`; phải dương. |
 | `--resume-from PATH` | Không có | Resume checkpoint thuộc `--work-dir`; không dùng với prepared-from. |
 | `--inspect-model` | Tắt | Inspect trainable LoRA rồi dừng. |
