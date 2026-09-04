@@ -2,17 +2,16 @@ from __future__ import annotations
 
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
-from hashlib import sha256
 import mimetypes
-import os
-import stat
 from pathlib import Path
 from threading import Lock
 
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ValidationError
+
+from labeler_streaming import OpenFileStreamingResponse, open_source_image
 
 from .batch import BatchManager, GPUCoordinator
 from .catalog import UnknownImageError, WorkspaceCatalog
@@ -38,7 +37,7 @@ from .storage import (
     SourceImageChanged,
     UnsafePersistencePath,
 )
-from .task_map import PP_DOCLAYOUTV3_LABELS
+from paddleocr_vl_contract import PP_DOCLAYOUTV3_LABELS
 from .vl_client import VLClient
 
 
@@ -52,45 +51,8 @@ class Workspace:
     store: AnnotationStore
 
 
-class OpenFileStreamingResponse(StreamingResponse):
-    def __init__(self, fd: int, *, content_length: int, media_type: str):
-        self.fd = fd
-        super().__init__(self._iter(), media_type=media_type, headers={"Content-Length": str(content_length)})
-
-    async def _iter(self):
-        try:
-            while True:
-                chunk = os.read(self.fd, 1024 * 1024)
-                if not chunk:
-                    break
-                yield chunk
-        finally:
-            if self.fd >= 0:
-                os.close(self.fd)
-                self.fd = -1
-
-
 def _open_image(catalog: WorkspaceCatalog, record):
-    path = record.path.resolve(strict=True)
-    if path.parent != catalog.root:
-        raise SourceImageChanged(record.relative_path)
-    descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
-    source_stat = os.fstat(descriptor)
-    if not stat.S_ISREG(source_stat.st_mode):
-        os.close(descriptor)
-        raise SourceImageChanged(record.relative_path)
-    digest = sha256()
-    while chunk := os.read(descriptor, 1024 * 1024):
-        digest.update(chunk)
-    os.lseek(descriptor, 0, os.SEEK_SET)
-    if (
-        source_stat.st_size != record.size_bytes
-        or source_stat.st_mtime_ns != record.mtime_ns
-        or digest.hexdigest() != record.sha256
-    ):
-        os.close(descriptor)
-        raise SourceImageChanged(record.relative_path)
-    return descriptor, source_stat.st_size
+    return open_source_image(catalog, record, SourceImageChanged)
 
 
 class AppState:

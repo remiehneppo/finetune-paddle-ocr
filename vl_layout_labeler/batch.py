@@ -1,11 +1,10 @@
 from __future__ import annotations
 
-import asyncio
-from copy import deepcopy
 from dataclasses import asdict, dataclass, field
-from threading import Event, Lock, Thread
+from threading import Lock
 
-from .post_validation import NoEligibleBlocks, OCRPostValidationError
+from batch_lifecycle import BatchLifecycleMixin
+from .batch_operations import DetectBatchOperation, PrelabelBatchOperation
 
 
 @dataclass(frozen=True)
@@ -78,118 +77,50 @@ class GPUCoordinator:
         return annotation.model_copy(update={"blocks": blocks, "status": status})
 
 
-class BatchManager:
+class BatchManager(BatchLifecycleMixin):
     def __init__(self, coordinator: GPUCoordinator, validation_service=None):
         self.coordinator = coordinator
         self.validation_service = validation_service
-        self._state_lock = Lock()
-        self._cancel = Event()
-        self._thread: Thread | None = None
-        self._snapshot = BatchSnapshot()
+        self.operations = {
+            "detect": DetectBatchOperation(coordinator),
+            "prelabel": PrelabelBatchOperation(coordinator, validation_service),
+        }
+        self._init_lifecycle(BatchSnapshot, BatchError)
 
     def start(
         self, operation: str, catalog, store, *, post_validate: bool = False
     ) -> BatchSnapshot:
         if operation not in {"detect", "prelabel"}:
             raise ValueError("unsupported batch operation")
-        with self._state_lock:
-            if self._thread is not None and self._thread.is_alive():
-                raise RuntimeError("a batch job is already running")
-            self._cancel.clear()
-            records = catalog.list_images()
-            self._snapshot = BatchSnapshot(
-                state="queued", operation=operation, total=len(records)
-            )
-            self._thread = Thread(
-                target=self._run,
-                args=(operation, records, store, post_validate),
-                daemon=True,
-            )
-            self._thread.start()
-            return deepcopy(self._snapshot)
+        records = catalog.list_images()
+        self._start_job(
+            BatchSnapshot(state="queued", operation=operation, total=len(records)),
+            self._run,
+            (operation, records, store, post_validate),
+        )
+        return self.snapshot()
 
     def _run(self, operation, records, store, post_validate) -> None:
-        with self._state_lock:
-            self._snapshot.state = "running"
-        for record in records:
-            with self._state_lock:
-                if self._cancel.is_set():
-                    self._snapshot.state = "cancelled"
-                    self._snapshot.current_image = None
+        try:
+            if not self._begin():
+                return
+            operation_adapter = self.operations[operation]
+            for record in records:
+                if not self._claim(record.name):
                     return
-                self._snapshot.current_image = record.name
-            try:
-                if record.error:
-                    raise ValueError(record.error)
-                existing = store.load(record)
-                if existing.status == "completed":
-                    self._increment("skipped")
-                    continue
-                if operation == "detect":
-                    if existing.blocks:
-                        self._increment("skipped")
-                        continue
-                    result = self.coordinator.detect(record).model_copy(
-                        update={"revision": existing.revision}
+                try:
+                    result = operation_adapter.execute(
+                        record, store, post_validate=post_validate
                     )
-                else:
-                    active_blocks = [
-                        block
-                        for block in existing.blocks
-                        if not block.skipped and block.task is not None
-                    ]
-                    if not active_blocks or all(block.text.strip() for block in active_blocks):
-                        self._increment("skipped")
-                        continue
-                    result = self.coordinator.prelabel(
-                        record, existing, replace_existing=False
-                    )
-                saved = store.save(record, result)
-                self._increment("processed")
-                if operation == "prelabel" and post_validate:
-                    try:
-                        if self.validation_service is None:
-                            raise RuntimeError("LLM validation is not configured")
-                        validated = self.validation_service.validate_annotation(saved)
-                        store.save(record, validated)
-                    except NoEligibleBlocks:
-                        pass
-                    except Exception as exc:
-                        message = (
-                            str(exc)
-                            if isinstance(exc, OCRPostValidationError)
-                            else "LLM validation failed"
-                        )
+                    self._increment("processed" if result.processed else "skipped")
+                    if result.validation_error is not None:
                         with self._state_lock:
                             self._snapshot.validation_failed += 1
                             self._snapshot.validation_errors.append(
-                                BatchError(record.name, message)
+                                BatchError(record.name, result.validation_error)
                             )
-            except Exception as exc:
-                with self._state_lock:
-                    self._snapshot.failed += 1
-                    self._snapshot.errors.append(BatchError(record.name, str(exc)))
-        with self._state_lock:
-            self._snapshot.state = "cancelled" if self._cancel.is_set() else "completed"
-            self._snapshot.current_image = None
-
-    def _increment(self, field_name: str) -> None:
-        with self._state_lock:
-            setattr(self._snapshot, field_name, getattr(self._snapshot, field_name) + 1)
-
-    def snapshot(self) -> BatchSnapshot:
-        with self._state_lock:
-            return deepcopy(self._snapshot)
-
-    def cancel(self) -> BatchSnapshot:
-        with self._state_lock:
-            if self._snapshot.state in {"queued", "running"}:
-                self._snapshot.state = "cancelling"
-                self._cancel.set()
-            return deepcopy(self._snapshot)
-
-    async def shutdown(self) -> None:
-        self.cancel()
-        thread = self._thread
-        if thread is not None:
-            await asyncio.to_thread(thread.join)
+                except Exception as exc:
+                    self._add_error(record.name, str(exc))
+            self._finish()
+        except Exception as exc:
+            self._fail(exc)

@@ -4,7 +4,9 @@ import math
 from .catalog import ImageRecord
 from .geometry import normalize_annotation, xyxy_to_polygon
 from .models import Annotation, Block, ImageInfo
-from .task_map import PP_DOCLAYOUTV3_LABEL_SET, map_layout_label
+from paddleocr_vl_contract import PP_DOCLAYOUTV3_LABEL_SET, task_for_layout_label
+
+map_layout_label = task_for_layout_label
 
 
 def _polygon(value) -> list[tuple[float, float]] | None:

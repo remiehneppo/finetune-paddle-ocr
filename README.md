@@ -10,6 +10,31 @@ OCR/table/formula/chart dùng chung
 `finetune_vl.py`; trộn nhiều layout trong một run qua cột `task` trong dataset
 để hạn chế phá các khả năng layout khác.
 
+### Trạng thái refactor kiến trúc ngày 04/09/2026
+
+Để tránh nhầm giữa code đã chạy và ý tưởng còn lại, trạng thái hiện tại là:
+
+| Candidate | Trạng thái | Phạm vi thực tế |
+| --- | --- | --- |
+| Prepared-run planning | Hoàn tất | `prepared_run_planning.py` tạo `PreparedRunPlan` bất biến; không copy source. |
+| VL target contract | Hoàn tất | `paddleocr_vl_contract.py` là contract chuẩn; module cũ chỉ là compatibility facade. |
+| Batch lifecycle | Hoàn tất | `batch_lifecycle.py` giữ concurrency/cancel/progress/terminal state; policy nằm ở operation adapters. |
+| Dataset admission | Một phần có chủ đích | `dataset_admission.py` dùng chung decode/limit/đổi RGB/digest và rejection accounting; sample/task semantics vẫn ở từng workflow. |
+| Labeler shell | Một phần có chủ đích | `labeler_catalog.py` và `labeler_streaming.py` dùng chung catalog/source safety; workspace state và route translation vẫn riêng. |
+| Annotation export | Một phần có chủ đích | `vl_layout_labeler/export.py` có public seam và `export_all` atomic; format implementation vẫn phụ thuộc private store helpers. |
+
+Các trạng thái “một phần” là giới hạn đã biết, không phải phần đã hoàn tất ngầm:
+cần thiết kế interface snapshot/workspace trước khi tiếp tục tách module. Các
+thay đổi canvas/UI đang dở không nằm trong commit refactor này.
+
+### Kiểm chứng và giới hạn kết luận
+
+Regression tập trung cho admission, batch, export và post-validation đã chạy
+`49 passed`. Llama server ở `http://127.0.0.1:8000/v1` và model
+`paddleocr-vl` đã được client gọi thành công; đây chỉ là smoke endpoint, không
+phải đánh giá chất lượng OCR. Các test này cũng không chứng minh GPU training,
+browser QA hoặc khả năng resume sau khi server restart.
+
 ### Phân biệt CLI và kiến trúc prepared-run
 
 `--prepared-from` và `--prepared-weight` là CLI dành cho người dùng. Phần

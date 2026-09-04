@@ -3,7 +3,6 @@ from __future__ import annotations
 import json
 import io
 import os
-import random
 import secrets
 import shutil
 import stat
@@ -14,9 +13,14 @@ from datetime import datetime
 from pathlib import Path
 
 from PIL import Image
-from paddleocr_vl_tasks import validate_target_for_task
+from paddleocr_vl_contract import (
+    PP_DOCLAYOUTV3_LABELS,
+    PP_DOCLAYOUTV3_LABEL_SET,
+    validate_target_for_task,
+)
 
 from .catalog import ImageRecord, WorkspaceCatalog, _file_sha256
+from .export import AnnotationExportService, ExportError, split_layout_pages
 from .geometry import (
     clamp_polygon,
     crop_box_from_polygon,
@@ -25,7 +29,6 @@ from .geometry import (
     polygon_to_xywh,
 )
 from .models import Annotation, ImageInfo
-from .task_map import PP_DOCLAYOUTV3_LABELS, PP_DOCLAYOUTV3_LABEL_SET
 
 
 class RevisionConflict(RuntimeError):
@@ -38,22 +41,6 @@ class SourceImageChanged(RuntimeError):
 
 class UnsafePersistencePath(ValueError):
     pass
-
-
-class ExportError(RuntimeError):
-    pass
-
-
-def split_layout_pages(pages: list, seed: int = 42) -> tuple[list, list]:
-    if len(pages) < 2:
-        raise ExportError("layout export requires at least two valid completed pages")
-    shuffled = list(pages)
-    random.Random(seed).shuffle(shuffled)
-    validation_count = max(1, min(len(shuffled) - 1, round(len(shuffled) * 0.1)))
-    validation_ids = {id(page) for page in shuffled[:validation_count]}
-    train = [page for page in pages if id(page) not in validation_ids]
-    validation = [page for page in pages if id(page) in validation_ids]
-    return train, validation
 
 
 def _is_within(path: Path, root: Path) -> bool:
@@ -156,6 +143,7 @@ class AnnotationStore:
         self.data_dir = self.root / data_dir_name
         self.annotations_dir = self.data_dir / "annotations"
         self._save_lock = threading.Lock()
+        self.exporter = AnnotationExportService(self)
 
     def _path(self, record: ImageRecord) -> Path:
         return self.annotations_dir / f"{Path(record.name).stem}.json"
@@ -250,7 +238,7 @@ class AnnotationStore:
             _atomic_text(self.root, self._path(record), saved.model_dump_json(indent=2))
             return saved
 
-    def export_hf(self, catalog: WorkspaceCatalog, output_dir: Path) -> dict:
+    def _export_hf(self, catalog: WorkspaceCatalog, output_dir: Path) -> dict:
         output = output_dir.expanduser().resolve()
         if output.exists():
             raise ExportError(f"export path already exists: {output}")
@@ -454,7 +442,7 @@ class AnnotationStore:
             ],
         }
 
-    def export_layout(self, catalog: WorkspaceCatalog, output_dir: Path) -> dict:
+    def _export_layout(self, catalog: WorkspaceCatalog, output_dir: Path) -> dict:
         output = output_dir.expanduser().resolve()
         if output.exists():
             raise ExportError(f"export path already exists: {output}")
@@ -523,28 +511,11 @@ class AnnotationStore:
             "annotations": sum(len(page["blocks"]) for page in pages),
         }
 
+    def export_hf(self, catalog: WorkspaceCatalog, output_dir: Path) -> dict:
+        return self.exporter.export_hf(catalog, output_dir)
+
+    def export_layout(self, catalog: WorkspaceCatalog, output_dir: Path) -> dict:
+        return self.exporter.export_layout(catalog, output_dir)
+
     def export_all(self, catalog: WorkspaceCatalog, output_dir: Path) -> dict:
-        output = output_dir.expanduser().resolve()
-        if output.exists():
-            raise ExportError(f"export path already exists: {output}")
-        output.parent.mkdir(parents=True, exist_ok=True)
-        temporary_root = Path(
-            tempfile.mkdtemp(prefix=".vl-layout-all-export-", dir=output.parent)
-        )
-        dataset_root = temporary_root / "dataset"
-        dataset_root.mkdir()
-        try:
-            hf = self.export_hf(catalog, dataset_root / "vl")
-            layout = self.export_layout(catalog, dataset_root / "layout")
-            os.replace(dataset_root, output)
-        except BaseException:
-            if output.exists():
-                shutil.rmtree(output, ignore_errors=True)
-            raise
-        finally:
-            shutil.rmtree(temporary_root, ignore_errors=True)
-        return {
-            "path": str(output),
-            "vl": {**hf, "path": str(output / "vl")},
-            "layout": {**layout, "path": str(output / "layout")},
-        }
+        return self.exporter.export_all(catalog, output_dir)

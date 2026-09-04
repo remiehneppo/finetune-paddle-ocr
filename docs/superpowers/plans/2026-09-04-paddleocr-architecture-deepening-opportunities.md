@@ -1,7 +1,7 @@
 # PaddleOCR Architecture Deepening Opportunities
 
 **Date:** 2026-09-04
-**Status:** Candidate list; Candidate 5 implemented on 2026-09-04
+**Status:** Candidates 2, 4, and 5 implemented; Candidates 1, 3, and 6 partially implemented on 2026-09-04
 **Scope:** Custom PaddleOCR-VL fine-tuning, prepared runs, OCR/VL labelers, exports, and post-validation
 
 ## Context
@@ -185,3 +185,32 @@ compatibility checks, legacy single-run metadata, and atomic summary writing.
 
 The remaining candidates still require a separate design pass before moving
 interfaces or files.
+
+Candidate 4 is implemented in `paddleocr_vl_contract.py`, with
+`paddleocr_vl_tasks.py` and `vl_layout_labeler/task_map.py` retained as
+compatibility facades. Candidate 3 remains partial: the public orchestration
+and atomic `export_all` seam live in `vl_layout_labeler/export.py`, but the
+format-specific implementations still depend on private `AnnotationStore`
+helpers. It is intentionally not described as a fully independent export
+module until those helpers consume a validated snapshot interface.
+
+Candidate 2 is implemented with the shared lifecycle mixin in
+`batch_lifecycle.py` used by both labeler batch managers. Operation-specific
+detect, prelabel, validation, and OCR policy remain local adapters by design.
+Candidate 1 centralizes catalog and safe source streaming in
+`labeler_catalog.py` and `labeler_streaming.py`, while workspace state and
+task-specific routes remain separate. Candidate 6 centralizes image admission
+and rejection accounting in `dataset_admission.py`; task-specific sample
+construction and summary field names remain separate. Candidates 1, 3, and 6
+are deliberately partial implementations, not claims that all labeler or
+training duplication is gone.
+
+## Verification boundary
+
+- Focused runtime regression after the 2026-09-04 changes: `49 passed`; the
+  environment emits one existing Starlette/httpx deprecation warning.
+- The local Llama endpoint was smoke-tested through `/v1/models` and the VL
+  client path. A generated answer is endpoint evidence only, not an OCR quality
+  gate, GPU-training result, browser QA result, or live-resume guarantee.
+- The `.venv-vl-eval` environment still lacks `datasets`, while `.venv` lacks
+  `pytest`; use the documented combined `PYTHONPATH` test command when needed.

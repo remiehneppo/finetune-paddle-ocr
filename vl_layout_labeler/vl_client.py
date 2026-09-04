@@ -8,7 +8,9 @@ import httpx
 from PIL import Image
 
 from .geometry import crop_box_from_polygon
-from .task_map import prompt_for_block_task
+from paddleocr_vl_contract import prompt_for_task
+
+prompt_for_block_task = prompt_for_task
 
 
 class VLClientError(RuntimeError):

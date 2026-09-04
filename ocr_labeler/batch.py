@@ -1,7 +1,8 @@
-import asyncio
-from copy import deepcopy
 from dataclasses import asdict, dataclass, field
-from threading import Event, Lock, Thread
+from threading import Lock
+
+from batch_lifecycle import BatchLifecycleMixin
+from .batch_operations import RecognitionBatchOperation
 
 
 @dataclass(frozen=True)
@@ -34,44 +35,20 @@ class InferenceCoordinator:
             return self.engine.recognize(record)
 
 
-class BatchManager:
+class BatchManager(BatchLifecycleMixin):
     def __init__(self, coordinator: InferenceCoordinator):
         self.coordinator = coordinator
-        self._state_lock = Lock()
-        self._cancel = Event()
-        self._thread: Thread | None = None
-        self._snapshot = BatchSnapshot()
+        self.operation = RecognitionBatchOperation(coordinator)
+        self._init_lifecycle(BatchSnapshot, BatchError)
 
     def start(self, catalog, store) -> BatchSnapshot:
         records = catalog.list_images()
-        with self._state_lock:
-            if self._thread is not None and self._thread.is_alive():
-                raise RuntimeError("a batch job is already running")
-            self._cancel.clear()
-            self._snapshot = BatchSnapshot(state="queued", total=len(records))
-            self._thread = Thread(target=self._run, args=(records, store), daemon=True)
-            self._thread.start()
+        self._start_job(
+            BatchSnapshot(state="queued", total=len(records)),
+            self._run,
+            (records, store),
+        )
         return self.snapshot()
-
-    def cancel(self) -> BatchSnapshot:
-        with self._state_lock:
-            if self._snapshot.state in {"queued", "running"}:
-                self._snapshot.state = "cancelling"
-                self._cancel.set()
-            return deepcopy(self._snapshot)
-
-    def snapshot(self) -> BatchSnapshot:
-        with self._state_lock:
-            return deepcopy(self._snapshot)
-
-    def wait(self, timeout=None) -> None:
-        thread = self._thread
-        if thread is not None:
-            thread.join(timeout)
-
-    async def shutdown(self) -> None:
-        self.cancel()
-        await asyncio.to_thread(self.wait)
 
     def _run(self, records, store) -> None:
         try:
@@ -81,60 +58,10 @@ class BatchManager:
                 if not self._claim(record.name):
                     return
                 try:
-                    if record.error:
-                        self._add_error(record.name, record.error)
-                        continue
-                    if store.has_annotation(record):
-                        store.load(record)
-                        self._increment("skipped")
-                        continue
-                    annotation = self.coordinator.recognize(record)
-                    store.save(record, annotation)
-                    self._increment("processed")
+                    processed = self.operation.execute(record, store)
+                    self._increment("processed" if processed else "skipped")
                 except Exception as exc:
                     self._add_error(record.name, str(exc))
             self._finish()
         except Exception as exc:
             self._fail(exc)
-
-    def _begin(self) -> bool:
-        with self._state_lock:
-            if self._cancel.is_set():
-                self._snapshot.state = "cancelled"
-                self._snapshot.current_image = None
-                return False
-            self._snapshot.state = "running"
-            return True
-
-    def _claim(self, image: str) -> bool:
-        with self._state_lock:
-            if self._cancel.is_set():
-                self._snapshot.state = "cancelled"
-                self._snapshot.current_image = None
-                return False
-            self._snapshot.current_image = image
-            return True
-
-    def _finish(self) -> None:
-        with self._state_lock:
-            self._snapshot.state = (
-                "cancelled" if self._cancel.is_set() else "completed"
-            )
-            self._snapshot.current_image = None
-
-    def _fail(self, exc: Exception) -> None:
-        with self._state_lock:
-            image = self._snapshot.current_image or "<batch>"
-            self._snapshot.state = "failed"
-            self._snapshot.current_image = None
-            self._snapshot.failed += 1
-            self._snapshot.errors.append(BatchError(image=image, message=str(exc)))
-
-    def _increment(self, name: str) -> None:
-        with self._state_lock:
-            setattr(self._snapshot, name, getattr(self._snapshot, name) + 1)
-
-    def _add_error(self, image: str, message: str) -> None:
-        with self._state_lock:
-            self._snapshot.failed += 1
-            self._snapshot.errors.append(BatchError(image=image, message=message))

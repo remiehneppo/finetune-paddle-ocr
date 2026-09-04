@@ -11,6 +11,41 @@ Contract target theo tài liệu ERNIEKit chính thức: table là **OTSL**
 (`<fcel>`, `<ecel>`, `<xcel>`, `<lcel>`, `<ucel>`, `<nl>`), formula là LaTeX,
 chart là bảng Markdown. HTML table bị từ chối thay vì train sai schema.
 
+## Bản đồ module và trạng thái refactor
+
+Các module sau là code đang được dùng, nhưng không phải module nào cũng đã tách
+hoàn toàn khỏi implementation cũ:
+
+| Module | Trạng thái | Trách nhiệm hiện tại |
+| --- | --- | --- |
+| `paddleocr_vl_contract.py` | Hoàn tất | Task, prompt, target, taxonomy và ERNIEKit record contract chuẩn. |
+| `prepared_run_planning.py` | Hoàn tất | Plan bất biến cho prepared run, weight chuẩn hóa và provenance. |
+| `batch_lifecycle.py` | Hoàn tất | Lifecycle batch dùng chung; detect/prelabel/validation vẫn là adapter riêng. |
+| `dataset_admission.py` | Một phần | Decode ảnh, pixel limit, RGB, digest và rejection accounting dùng chung; sample builder vẫn riêng. |
+| `vl_layout_labeler/export.py` | Một phần | Public export seam và atomic `export_all`; format writer còn dùng private store helpers. |
+| `labeler_catalog.py`, `labeler_streaming.py` | Một phần | Catalog và source streaming an toàn dùng chung giữa hai labeler. |
+
+`paddleocr_vl_tasks.py` và `vl_layout_labeler/task_map.py` vẫn tồn tại để giữ
+compatibility import; code mới nên import từ `paddleocr_vl_contract.py`. Không
+đưa canvas/UI đang chỉnh dở vào các commit kiến trúc.
+
+### Llama server và post-validation
+
+`--vl-base-url http://127.0.0.1:8000/v1` là endpoint prelabel mặc định khi
+llama-server đã chạy. `--vl-model paddleocr-vl` phải trùng model id trả về ở
+`/v1/models`. Post-validation là endpoint riêng, chỉ bật khi truyền đồng thời
+`--validation-base-url` và `--validation-model`; không tự suy ra từ endpoint
+prelabel và không được hiểu là quality gate của model OCR.
+
+Kiểm tra nhanh endpoint trước khi mở labeler:
+
+```bash
+curl -fsS http://127.0.0.1:8000/v1/models
+```
+
+Smoke thành công chỉ chứng minh URL/model/prompt path hoạt động. Nó không chứng
+minh chất lượng OCR, GPU training, browser QA hoặc resume sau restart.
+
 ## Môi trường tách biệt
 
 Không cài ERNIEKit/PaddleOCR-VL vào virtualenv PP-OCRv6 hiện có.

@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import argparse
-import io
 import json
 import logging
 import os
@@ -15,7 +14,6 @@ import sys
 import unicodedata
 import urllib.parse
 import urllib.request
-from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -23,6 +21,10 @@ from typing import Any, Iterable, Mapping, Sequence
 
 import yaml
 from PIL import Image, UnidentifiedImageError
+
+from dataset_admission import checked_image_copy as admit_image_copy
+from dataset_admission import open_image_value
+from dataset_admission import RejectionReport
 
 
 LOGGER = logging.getLogger("paddleocr_vi_finetune")
@@ -41,40 +43,6 @@ class PreparedSample:
     image_path: str
     text: str
     dataset_index: int
-
-
-class RejectionReport:
-    def __init__(self, path: Path) -> None:
-        self.path = path
-        self._file = path.open("w", encoding="utf-8")
-        self.counts: Counter[str] = Counter()
-
-    def reject(
-        self,
-        dataset: Path,
-        split: str,
-        row_index: int,
-        reason: str,
-        detail: str = "",
-    ) -> None:
-        self.counts[reason] += 1
-        record = {
-            "dataset": str(dataset),
-            "split": split,
-            "row_index": row_index,
-            "reason": reason,
-            "detail": detail[:500],
-        }
-        self._file.write(json.dumps(record, ensure_ascii=False) + "\n")
-
-    def close(self) -> None:
-        self._file.close()
-
-    def __enter__(self) -> "RejectionReport":
-        return self
-
-    def __exit__(self, *_: object) -> None:
-        self.close()
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -259,45 +227,11 @@ def unsupported_characters(text: str, characters: set[str]) -> list[str]:
 
 
 def checked_image_copy(image: Image.Image, max_image_pixels: int) -> Image.Image:
-    width, height = image.size
-    if width <= 1 or height <= 1:
-        raise ValueError(f"invalid dimensions {width}x{height}")
-    if width * height > max_image_pixels:
-        raise ValueError(f"image has {width * height} pixels; limit is {max_image_pixels}")
-    image.load()
-    return image.copy()
+    return admit_image_copy(image, max_image_pixels)
 
 
 def open_image(value: Any, dataset_dir: Path, max_image_pixels: int) -> Image.Image:
-    if isinstance(value, Image.Image):
-        return checked_image_copy(value, max_image_pixels)
-
-    if isinstance(value, Mapping):
-        raw_bytes = value.get("bytes")
-        if raw_bytes is not None:
-            with Image.open(io.BytesIO(raw_bytes)) as image:
-                return checked_image_copy(image, max_image_pixels)
-        value = value.get("path")
-
-    if isinstance(value, (str, os.PathLike)):
-        path = Path(value).expanduser()
-        if not path.is_absolute():
-            path = dataset_dir / path
-        with Image.open(path) as image:
-            return checked_image_copy(image, max_image_pixels)
-
-    if hasattr(value, "__array_interface__"):
-        image = Image.fromarray(value)
-        width, height = image.size
-        if width <= 1 or height <= 1:
-            raise ValueError(f"invalid dimensions {width}x{height}")
-        if width * height > max_image_pixels:
-            raise ValueError(
-                f"image has {width * height} pixels; limit is {max_image_pixels}"
-            )
-        return image
-
-    raise TypeError(f"Unsupported image value type: {type(value).__name__}")
+    return open_image_value(value, dataset_dir, max_image_pixels)
 
 
 def save_lossless_image(image: Image.Image, path: Path) -> None:

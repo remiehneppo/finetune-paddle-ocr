@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import argparse
-import io
 import json
 import logging
 import math
@@ -17,24 +16,30 @@ import sys
 import tempfile
 import threading
 import unicodedata
-from collections import Counter, defaultdict
+from collections import defaultdict
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal
 from pathlib import Path
-from typing import Any, Self
+from typing import Any
 
 import yaml
 from PIL import Image, UnidentifiedImageError
+from dataset_admission import checked_image_copy as admit_image_copy
+from dataset_admission import open_image_value
+from dataset_admission import RejectionReport
 
 import finetune as rec_loader
 from prepared_run_planning import PreparedRunPlanner
-from paddleocr_vl_tasks import (
+from paddleocr_vl_contract import (
     TASK_PROMPTS,
+    normalize_summary_tasks,
+    normalize_target_text,
     prompt_for_task,
     resolve_row_task,
     task_for_prompt,
+    validate_erniekit_record_contract,
     validate_target_for_task,
 )
 
@@ -70,17 +75,8 @@ normalize_text = rec_loader.normalize_text
 
 
 def normalize_target(row: Mapping[str, Any], task: str = "ocr") -> str:
-    value: str | None = None
-    for column in ("label", "text"):
-        candidate = row.get(column)
-        if isinstance(candidate, str) and candidate.strip():
-            value = candidate
-            break
-    if value is None:
-        return ""
-    value = unicodedata.normalize("NFC", value)
-    value = value.replace("\r\n", "\n").replace("\r", "\n")
-    return value if value.strip() else ""
+    del task
+    return normalize_target_text(row)
 
 
 @dataclass(frozen=True)
@@ -104,41 +100,6 @@ class TrainableParameterReport:
 
 class PixelLimitExceeded(ValueError):
     pass
-
-
-class RejectionReport:
-    def __init__(self, path: Path) -> None:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        self.path = path
-        self._file = path.open("w", encoding="utf-8", newline="\n")
-        self.counts: Counter[str] = Counter()
-
-    def reject(
-        self,
-        dataset: Path,
-        split: str,
-        row_index: int,
-        reason: str,
-        detail: str = "",
-    ) -> None:
-        self.counts[reason] += 1
-        record = {
-            "dataset": str(dataset),
-            "split": split,
-            "row_index": row_index,
-            "reason": reason,
-            "detail": detail[:500],
-        }
-        self._file.write(json.dumps(record, ensure_ascii=False) + "\n")
-
-    def close(self) -> None:
-        self._file.close()
-
-    def __enter__(self) -> Self:
-        return self
-
-    def __exit__(self, *_: object) -> None:
-        self.close()
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -496,36 +457,22 @@ def selected_devices(value: str) -> tuple[str, ...]:
 
 
 def _checked_rgb(image: Image.Image, max_image_pixels: int) -> Image.Image:
-    width, height = image.size
-    if width <= 1 or height <= 1:
-        raise ValueError(f"invalid dimensions {width}x{height}")
-    pixels = width * height
-    if pixels > max_image_pixels:
-        raise PixelLimitExceeded(
-            f"image has {pixels} pixels; limit is {max_image_pixels}"
-        )
-    image.load()
-    return image.convert("RGB")
+    return admit_image_copy(
+        image,
+        max_image_pixels,
+        convert_rgb=True,
+        pixel_limit_error=PixelLimitExceeded,
+    )
 
 
 def open_image_rgb(value: Any, dataset_dir: Path, max_image_pixels: int) -> Image.Image:
-    if isinstance(value, Image.Image):
-        return _checked_rgb(value.copy(), max_image_pixels)
-    if isinstance(value, Mapping):
-        raw_bytes = value.get("bytes")
-        if raw_bytes is not None:
-            with Image.open(io.BytesIO(raw_bytes)) as image:
-                return _checked_rgb(image, max_image_pixels)
-        value = value.get("path")
-    if isinstance(value, (str, os.PathLike)):
-        path = Path(value).expanduser()
-        if not path.is_absolute():
-            path = dataset_dir / path
-        with Image.open(path) as image:
-            return _checked_rgb(image, max_image_pixels)
-    if hasattr(value, "__array_interface__"):
-        return _checked_rgb(Image.fromarray(value), max_image_pixels)
-    raise TypeError(f"Unsupported image value type: {type(value).__name__}")
+    return open_image_value(
+        value,
+        dataset_dir,
+        max_image_pixels,
+        convert_rgb=True,
+        pixel_limit_error=PixelLimitExceeded,
+    )
 
 
 def _save_png(image: Image.Image, path: Path) -> None:
@@ -853,37 +800,17 @@ def _validate_prepared_jsonl(
             if not isinstance(payload, Mapping):
                 raise TypeError(f"Invalid sample in {path}:{line_number}")
 
-            image_info = payload.get("image_info")
-            text_info = payload.get("text_info")
-            if not isinstance(image_info, list) or len(image_info) != 1:
-                raise ValueError(f"Invalid image_info contract in {path}:{line_number}")
-            if not isinstance(text_info, list) or len(text_info) != 2:
-                raise ValueError(f"Invalid text_info contract in {path}:{line_number}")
-            image = image_info[0]
-            prompt_row, target = text_info
-            if (
-                not isinstance(image, Mapping)
-                or image.get("matched_text_index") != 0
-                or not isinstance(prompt_row, Mapping)
-                or prompt_row.get("tag") != "mask"
-                or not isinstance(prompt_row.get("text"), str)
-                or prompt_row["text"] not in allowed
-                or not isinstance(target, Mapping)
-                or target.get("tag") != "no_mask"
-                or not isinstance(target.get("text"), str)
-                or not target["text"]
-            ):
-                raise ValueError(f"Invalid task mask contract in {path}:{line_number}")
-            task = task_for_prompt(prompt_row["text"])
             try:
-                validate_target_for_task(target["text"], task)
+                _, image_url = validate_erniekit_record_contract(
+                    payload.get("image_info"),
+                    payload.get("text_info"),
+                    tuple(allowed),
+                )
             except ValueError as exc:
-                raise ValueError(
-                    f"Invalid {task} target schema in {path}:{line_number}: {exc}"
-                ) from exc
+                raise ValueError(f"{exc} in {path}:{line_number}") from exc
 
             image_path = _resolve_reused_path(
-                image.get("image_url"), path.parent, "image_url"
+                image_url, path.parent, "image_url"
             )
             if not image_path.is_file():
                 raise FileNotFoundError(
@@ -894,42 +821,7 @@ def _validate_prepared_jsonl(
 
 
 def _normalize_summary_tasks(summary: dict[str, Any]) -> list[str]:
-    raw_tasks = summary.get("tasks")
-    if isinstance(raw_tasks, list) and raw_tasks:
-        normalized: list[str] = []
-        for task in raw_tasks:
-            if not isinstance(task, str):
-                raise TypeError("Prepared summary tasks must be strings")
-            prompt_for_task(task)
-            normalized.append(task)
-        tasks = sorted(set(normalized))
-    else:
-        legacy_task = summary.get("task", "ocr")
-        if legacy_task == "mixed":
-            raise ValueError("Prepared summary task='mixed' requires a non-empty tasks list")
-        if not isinstance(legacy_task, str):
-            raise TypeError("Prepared summary task must be a string")
-        prompt_for_task(legacy_task)
-        tasks = [legacy_task]
-
-    prompts = [prompt_for_task(task) for task in tasks]
-    if "prompt" in summary and summary["prompt"] not in prompts:
-        raise ValueError(
-            f"Prepared summary prompt {summary['prompt']!r} does not match tasks {tasks}"
-        )
-    if "prompts" in summary:
-        recorded = summary["prompts"]
-        if not isinstance(recorded, list) or set(recorded) != set(prompts):
-            raise ValueError("Prepared summary prompts do not match tasks")
-    summary["tasks"] = tasks
-    summary["prompts"] = prompts
-    if len(tasks) == 1:
-        summary["task"] = tasks[0]
-        summary["prompt"] = prompts[0]
-    else:
-        summary["task"] = "mixed"
-        summary.pop("prompt", None)
-    return tasks
+    return normalize_summary_tasks(summary)
 
 
 def read_prepared_run(prepared_from: Path) -> dict[str, Any]:

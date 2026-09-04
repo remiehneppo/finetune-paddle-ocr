@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import argparse
 import copy
-import hashlib
 import json
 import logging
 import math
@@ -22,7 +21,7 @@ import subprocess
 import sys
 import urllib.parse
 import urllib.request
-from collections import Counter, defaultdict
+from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -30,6 +29,8 @@ from typing import Any, Iterable, Sequence
 
 import yaml
 from PIL import Image, UnidentifiedImageError
+
+from dataset_admission import RejectionReport, inspect_image_file
 
 
 LOGGER = logging.getLogger("paddleocr_det_finetune")
@@ -57,42 +58,6 @@ class PreparedSample:
     dataset_index: int
     source_image: str
     sha256: str
-
-
-class RejectionReport:
-    def __init__(self, path: Path) -> None:
-        self.path = path
-        self._handle = path.open("w", encoding="utf-8", newline="\n")
-        self.counts: Counter[str] = Counter()
-
-    def add(
-        self,
-        source: DatasetSource,
-        line_number: int,
-        reason: str,
-        detail: str = "",
-        box_index: int | None = None,
-    ) -> None:
-        self.counts[reason] += 1
-        row: dict[str, Any] = {
-            "dataset": str(source.root),
-            "label_file": str(source.labels),
-            "line_number": line_number,
-            "reason": reason,
-            "detail": detail[:500],
-        }
-        if box_index is not None:
-            row["box_index"] = box_index
-        self._handle.write(json.dumps(row, ensure_ascii=False) + "\n")
-
-    def close(self) -> None:
-        self._handle.close()
-
-    def __enter__(self) -> "RejectionReport":
-        return self
-
-    def __exit__(self, *_: object) -> None:
-        self.close()
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -233,22 +198,7 @@ def _sha256(data: bytes) -> str:
 
 
 def inspect_image(path: Path, max_pixels: int) -> tuple[int, int, bytes, str]:
-    data = path.read_bytes()
-    if not data:
-        raise ValueError("empty image file")
-    try:
-        with Image.open(path) as image:
-            width, height = image.size
-            if width <= 0 or height <= 0:
-                raise ValueError("image has invalid dimensions")
-            if width * height > max_pixels:
-                raise ValueError(
-                    f"image has {width * height} pixels, limit is {max_pixels}"
-                )
-            image.load()
-    except (OSError, UnidentifiedImageError) as exc:
-        raise ValueError(f"cannot decode image: {exc}") from exc
-    return width, height, data, _sha256(data)
+    return inspect_image_file(path, max_pixels)
 
 
 def polygon_area(points: Sequence[Sequence[float]]) -> float:

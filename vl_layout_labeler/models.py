@@ -7,12 +7,16 @@ from typing import Any, Literal
 from uuid import UUID, uuid4
 
 from pydantic import BaseModel, Field, field_validator, model_validator
-from paddleocr_vl_tasks import validate_target_for_task
+from paddleocr_vl_contract import (
+    PP_DOCLAYOUTV3_LABEL_SET,
+    PaddleOCRVLTask,
+    validate_target_for_task,
+)
 
 Point = tuple[float, float]
 LayoutSource = Literal["layout", "vl", "manual"]
 AnnotationStatus = Literal["draft", "detected", "edited", "completed"]
-Task = Literal["ocr", "table", "formula", "chart"]
+Task = PaddleOCRVLTask
 
 
 class ValidationIssue(BaseModel):
@@ -120,8 +124,6 @@ class Annotation(BaseModel):
         if len(ids) != len(set(ids)):
             raise ValueError("block ids must be unique")
         if self.status == "completed":
-            from .task_map import PP_DOCLAYOUTV3_LABEL_SET
-
             active = [block for block in self.blocks if not block.skipped]
             if not active:
                 raise ValueError("completed annotations require at least one active block")
