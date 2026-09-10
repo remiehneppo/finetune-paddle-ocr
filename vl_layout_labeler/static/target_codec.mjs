@@ -14,7 +14,7 @@ export const OTSL_CELL_TOKENS = Object.freeze([
 ]);
 
 const OTSL_TOKEN_PATTERN = /<(?:fcel|ecel|lcel|ucel|xcel|nl)>/g;
-const ANGLE_TAG_PATTERN = /<[^>\n]+>/g;
+const ANGLE_TAG_PATTERN = /<[^<>\n]+>/g;
 const HTML_TABLE_PATTERN = /<\/?(?:table|thead|tbody|tfoot|tr|th|td)\b/i;
 const OTSL_TAGS = new Set([...OTSL_CELL_TOKENS, "<nl>"]);
 
@@ -359,4 +359,73 @@ export function createStarterModel(task) {
 
 export function cloneTargetModel(model) {
   return clone(model);
+}
+
+export function splitOcrLine(lines, index, start, end = start) {
+  const currentList = Array.isArray(lines) ? [...lines] : [];
+  if (index < 0 || index >= currentList.length) {
+    return { lines: currentList, focus: null };
+  }
+  const current = String(currentList[index] ?? "");
+  const safeStart = Math.max(0, Math.min(Number.isFinite(start) ? start : current.length, current.length));
+  const safeEnd = Math.max(safeStart, Math.min(Number.isFinite(end) ? end : safeStart, current.length));
+  const before = current.slice(0, safeStart);
+  const after = current.slice(safeEnd);
+  currentList.splice(index, 1, before, after);
+  return {
+    lines: currentList,
+    focus: { index: index + 1, position: 0 },
+  };
+}
+
+export function mergeOcrLine(lines, index) {
+  const currentList = Array.isArray(lines) ? [...lines] : [];
+  if (index <= 0 || index >= currentList.length) {
+    return { lines: currentList, focus: null };
+  }
+  const prev = String(currentList[index - 1] ?? "");
+  const current = String(currentList[index] ?? "");
+  currentList.splice(index - 1, 2, prev + current);
+  return {
+    lines: currentList,
+    focus: { index: index - 1, position: prev.length },
+  };
+}
+
+export function pasteOcrLines(lines, index, start, end = start, pastedText = "") {
+  const currentList = Array.isArray(lines) ? [...lines] : [];
+  if (index < 0 || index >= currentList.length) {
+    return { lines: currentList, focus: null };
+  }
+  const current = String(currentList[index] ?? "");
+  const safeStart = Math.max(0, Math.min(Number.isFinite(start) ? start : current.length, current.length));
+  const safeEnd = Math.max(safeStart, Math.min(Number.isFinite(end) ? end : safeStart, current.length));
+  const before = current.slice(0, safeStart);
+  const after = current.slice(safeEnd);
+  const segments = String(pastedText ?? "")
+    .replace(/\r\n/g, "\n")
+    .replace(/\r/g, "\n")
+    .split("\n");
+  if (segments.length <= 1) {
+    const text = segments[0] ?? "";
+    const combined = before + text + after;
+    currentList.splice(index, 1, combined);
+    return {
+      lines: currentList,
+      focus: { index, position: before.length + text.length },
+    };
+  }
+  const first = before + segments[0];
+  const lastSegment = segments[segments.length - 1];
+  const last = lastSegment + after;
+  const middle = segments.slice(1, -1);
+  const inserted = [first, ...middle, last];
+  currentList.splice(index, 1, ...inserted);
+  return {
+    lines: currentList,
+    focus: {
+      index: index + inserted.length - 1,
+      position: lastSegment.length,
+    },
+  };
 }

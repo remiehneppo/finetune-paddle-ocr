@@ -269,9 +269,8 @@ pipeline detection/recognition lên GPU và để hàng đợi OCR tuần tự k
 bản. Nếu model, device hoặc folder startup không hợp lệ, service dừng với lỗi
 thay vì âm thầm chuyển sang CPU.
 
-Vì đây là công cụ local không có cơ chế đăng nhập, `--host` chỉ chấp nhận
-`localhost` hoặc địa chỉ loopback IPv4/IPv6 (ví dụ `127.0.0.1`, `::1`);
-`0.0.0.0` và địa chỉ LAN/public bị từ chối.
+Mặc định service bind vào `127.0.0.1`. Tham số `--host` cho phép cấu hình chạy
+trên host bất kỳ (ví dụ `0.0.0.0`, địa chỉ LAN hoặc loopback).
 
 ## Dịch vụ gán nhãn layout cho PaddleOCR-VL 1.6
 
@@ -290,11 +289,12 @@ python run_vl_layout_labeler.py \
   --layout-model-dir /home/tieubaoca/.paddlex/official_models/PP-DocLayoutV3 \
   --vl-base-url http://127.0.0.1:8000/v1 \
   --vl-model paddleocr-vl \
-  --device gpu:0
+  --device gpu:0 \
+  -t 10
 ```
 
-Mở `http://127.0.0.1:8012`. Service fail-fast nếu layout model hoặc endpoint
-VL không sẵn sàng, chỉ dùng một GPU queue và chỉ bind loopback. Sidecar riêng
+Mở `http://127.0.0.1:8012` (mặc định bind `127.0.0.1`, có thể dùng `--host` để bind host bất kỳ như `0.0.0.0`). Service fail-fast nếu layout model hoặc endpoint
+VL không sẵn sàng, hỗ trợ `-t`/`--threads` (mặc định 10) để chạy batch detect/prelabel song song. Sidecar riêng
 được lưu tại `<folder ảnh>/.paddleocr-vl-labeler/annotations/`. Sidecar version
 2 giữ đủ 25 class theo đúng thứ tự PP-DocLayoutV3. `table`, `chart`,
 `display_formula`/`inline_formula` được map lần lượt sang `table`, `chart`,

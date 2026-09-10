@@ -80,7 +80,7 @@ SKIP_LAYOUT_LABELS = frozenset(
 OTSL_CELL_TOKENS = ("<fcel>", "<ecel>", "<xcel>", "<lcel>", "<ucel>")
 OTSL_TAGS = frozenset((*OTSL_CELL_TOKENS, "<nl>"))
 HTML_TABLE_PATTERN = re.compile(r"</?(?:table|thead|tbody|tfoot|tr|th|td)\b", re.I)
-ANGLE_TAG_PATTERN = re.compile(r"<[^>\n]+>")
+ANGLE_TAG_PATTERN = re.compile(r"<[^<>\n]+>")
 OTSL_TOKEN_PATTERN = re.compile(r"<(?:fcel|ecel|lcel|ucel|xcel|nl)>")
 MARKDOWN_ALIGNMENT_PATTERN = re.compile(r"^:?-{3,}:?$")
 

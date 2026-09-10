@@ -137,10 +137,19 @@ class LabelerCLITests(unittest.TestCase):
                     )
                     self.assertIs(settings.validate(), settings)
 
-    def test_settings_accept_only_loopback_hosts(self):
+    def test_settings_accept_any_valid_hosts(self):
         with tempfile.TemporaryDirectory() as directory:
             model_dir = self.make_model_dir(Path(directory))
-            for host in ("localhost", "127.0.0.1", "127.23.45.67", "::1"):
+            for host in (
+                "localhost",
+                "127.0.0.1",
+                "127.23.45.67",
+                "::1",
+                "0.0.0.0",
+                "::",
+                "192.168.1.5",
+                "example.com",
+            ):
                 with self.subTest(host=host):
                     settings = build_settings(
                         parse_args(
@@ -154,13 +163,32 @@ class LabelerCLITests(unittest.TestCase):
                     )
                     self.assertIs(settings.validate(), settings)
 
-    def test_settings_reject_non_loopback_hosts(self):
+    def test_settings_reject_empty_hosts(self):
         with tempfile.TemporaryDirectory() as directory:
             model_dir = self.make_model_dir(Path(directory))
-            for host in ("0.0.0.0", "::", "192.168.1.5", "example.com"):
+            for host in ("", "   "):
                 with self.subTest(host=host):
                     with self.assertRaisesRegex(
-                        ValueError, "host must be localhost or a loopback address"
+                        ValueError, "host must not be empty"
+                    ):
+                        build_settings(
+                            parse_args(
+                                [
+                                    "--rec-model-dir",
+                                    str(model_dir),
+                                    "--host",
+                                    host,
+                                ]
+                            )
+                        ).validate()
+
+    def test_settings_reject_invalid_hosts(self):
+        with tempfile.TemporaryDirectory() as directory:
+            model_dir = self.make_model_dir(Path(directory))
+            for host in (":::", "invalid host with spaces"):
+                with self.subTest(host=host):
+                    with self.assertRaisesRegex(
+                        ValueError, "host must be a valid IP address or hostname"
                     ):
                         build_settings(
                             parse_args(

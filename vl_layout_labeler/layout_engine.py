@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import threading
 from .catalog import ImageRecord
 from .geometry import normalize_annotation, xyxy_to_polygon
 from .models import Annotation, Block, ImageInfo
@@ -95,6 +96,7 @@ class LayoutDetectionEngine:
     def __init__(self, settings, pipeline):
         self.settings = settings
         self.pipeline = pipeline
+        self._lock = threading.Lock()
 
     @classmethod
     def create(cls, settings):
@@ -113,8 +115,9 @@ class LayoutDetectionEngine:
     def detect(self, record: ImageRecord) -> Annotation:
         if record.error or record.width is None or record.height is None:
             raise ValueError(record.error or "image dimensions are unavailable")
-        results = self.pipeline.predict(str(record.path))
-        results = list(results)
+        with self._lock:
+            results = self.pipeline.predict(str(record.path))
+            results = list(results)
         if len(results) != 1:
             raise RuntimeError(f"expected one layout result, got {len(results)}")
         return normalize_layout_result(results[0], record)

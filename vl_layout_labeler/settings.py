@@ -3,6 +3,21 @@ from __future__ import annotations
 from dataclasses import dataclass
 import ipaddress
 from pathlib import Path
+import re
+
+
+def _is_valid_host(host: str) -> bool:
+    if host == "localhost":
+        return True
+    try:
+        ipaddress.ip_address(host)
+        return True
+    except ValueError:
+        pass
+    if len(host) > 253:
+        return False
+    allowed = re.compile(r"^(?!-)[A-Z0-9-]{1,63}(?<!-)$", re.IGNORECASE)
+    return all(allowed.match(part) for part in host.split("."))
 
 
 @dataclass(frozen=True)
@@ -19,9 +34,11 @@ class LabelerSettings:
     validation_api_key: str | None = None
     validation_timeout: float = 30.0
     validation_max_tokens: int = 2048
+    threads: int = 10
     host: str = "127.0.0.1"
     port: int = 8012
     data_dir_name: str = ".paddleocr-vl-labeler"
+    allowed_root: Path | None = None
 
     @property
     def validation_configured(self) -> bool:
@@ -31,14 +48,10 @@ class LabelerSettings:
         )
 
     def validate(self, *, require_runtime_models: bool = True) -> LabelerSettings:
-        if self.host != "localhost":
-            try:
-                if not ipaddress.ip_address(self.host).is_loopback:
-                    raise ValueError("host must be loopback-only")
-            except ValueError as exc:
-                if str(exc) == "host must be loopback-only":
-                    raise
-                raise ValueError("host must be localhost or a loopback IP") from exc
+        if not self.host or not self.host.strip():
+            raise ValueError("host must not be empty")
+        if not _is_valid_host(self.host.strip()):
+            raise ValueError("host must be a valid IP address or hostname")
         if self.port < 1 or self.port > 65535:
             raise ValueError("port must be between 1 and 65535")
         if not self.vl_base_url.strip():
@@ -55,6 +68,8 @@ class LabelerSettings:
             )
         if self.validation_timeout <= 0 or self.validation_max_tokens <= 0:
             raise ValueError("validation timeout and max tokens must be positive")
+        if self.threads <= 0:
+            raise ValueError("threads must be positive")
         if require_runtime_models:
             model_dir = self.layout_model_dir.expanduser().resolve()
             required = {"inference.json", "inference.pdiparams", "inference.yml"}

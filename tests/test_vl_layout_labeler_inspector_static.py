@@ -108,3 +108,22 @@ def test_processing_and_completed_states_are_explicit_and_lock_editing():
     assert ".completed-banner" in stylesheet
     toolbar_rule = stylesheet.split(".canvas-toolbar {", 1)[1].split("}", 1)[0]
     assert "flex-wrap: wrap;" in toolbar_rule
+
+
+def test_ocr_line_editor_uses_wrapping_textarea_and_enter_split():
+    app_script = Path("vl_layout_labeler/static/app.mjs").read_text(encoding="utf-8")
+    codec_script = Path("vl_layout_labeler/static/target_codec.mjs").read_text(encoding="utf-8")
+    styles = Path("vl_layout_labeler/static/styles.css").read_text(encoding="utf-8")
+    inspector_css = Path("vl_layout_labeler/static/inspector.css").read_text(encoding="utf-8")
+
+    assert "element(\"textarea\", \"line-input\")" in app_script
+    assert "splitOcrLine" in codec_script
+    assert "mergeOcrLine" in codec_script
+    assert "pasteOcrLines" in codec_script
+    assert "event.key === \"Enter\"" in app_script
+    assert "autoResizeLineInput" in app_script
+    assert ".line-row textarea" in styles
+    assert ".line-row textarea" in inspector_css
+    assert "white-space: pre-wrap;" in styles
+    assert "overflow-wrap: anywhere;" in styles
+    assert "overflow-wrap: anywhere;" in inspector_css

@@ -58,9 +58,13 @@ def _open_image(catalog: WorkspaceCatalog, record):
 class AppState:
     def __init__(self, settings, layout_engine, vl_client, validation_service):
         self.settings = settings
-        self.coordinator = GPUCoordinator(layout_engine, vl_client)
+        self.coordinator = GPUCoordinator(
+            layout_engine, vl_client, max_workers=settings.threads
+        )
         self.validation_service = validation_service
-        self.batch = BatchManager(self.coordinator, validation_service)
+        self.batch = BatchManager(
+            self.coordinator, validation_service, max_workers=settings.threads
+        )
         self._workspace: Workspace | None = None
         self.lock = Lock()
 
@@ -103,7 +107,16 @@ def create_app(
     @asynccontextmanager
     async def lifespan(app):
         if initial_workspace is not None:
-            catalog = WorkspaceCatalog.open(Path(initial_workspace))
+            init_path = Path(initial_workspace).expanduser().resolve()
+            if settings.allowed_root is not None:
+                allowed = settings.allowed_root.expanduser().resolve()
+                try:
+                    init_path.relative_to(allowed)
+                except ValueError:
+                    raise ValueError(
+                        f"initial workspace {initial_workspace} is outside allowed root {settings.allowed_root}"
+                    )
+            catalog = WorkspaceCatalog.open(init_path)
             with state.lock:
                 state.set_workspace(catalog)
         try:
@@ -178,8 +191,18 @@ def create_app(
 
     @app.post("/api/workspace/open")
     def open_workspace(request: OpenWorkspaceRequest):
+        workspace_path = Path(request.path).expanduser().resolve()
+        if settings.allowed_root is not None:
+            allowed = settings.allowed_root.expanduser().resolve()
+            try:
+                workspace_path.relative_to(allowed)
+            except ValueError:
+                raise HTTPException(
+                    status_code=403,
+                    detail="workspace path is outside the allowed root directory",
+                )
         try:
-            catalog = WorkspaceCatalog.open(Path(request.path))
+            catalog = WorkspaceCatalog.open(workspace_path)
         except (OSError, ValueError) as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
         if state.batch.snapshot().state in {"queued", "running", "cancelling"}:

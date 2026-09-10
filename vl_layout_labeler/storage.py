@@ -201,8 +201,8 @@ class AnnotationStore:
         return annotation
 
     def save(self, record: ImageRecord, annotation: Annotation) -> Annotation:
+        self._assert_source(record, annotation)
         with self._save_lock:
-            self._assert_source(record, annotation)
             current = self._load_saved(record)
             current_revision = current.revision if current is not None else 0
             if annotation.revision != current_revision:

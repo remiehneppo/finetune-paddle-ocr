@@ -189,6 +189,7 @@ python run_vl_layout_labeler.py \
   --layout-model-dir /home/tieubaoca/.paddlex/official_models/PP-DocLayoutV3 \
   --vl-base-url http://127.0.0.1:8000/v1 \
   --vl-model paddleocr-vl \
+  -t 10 \
   --port 8012
 ```
 

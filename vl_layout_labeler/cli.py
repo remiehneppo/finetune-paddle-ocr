@@ -24,9 +24,21 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--validation-api-key")
     parser.add_argument("--validation-timeout", type=float, default=30.0)
     parser.add_argument("--validation-max-tokens", type=int, default=2048)
+    parser.add_argument(
+        "-t",
+        "--threads",
+        type=int,
+        default=10,
+        help="number of parallel model threads for batch detect and prelabel (default: 10)",
+    )
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8012)
     parser.add_argument("--images", type=Path)
+    parser.add_argument(
+        "--allowed-root",
+        type=Path,
+        help="restrict workspace directories to paths within this directory root",
+    )
     return parser
 
 
@@ -48,8 +60,10 @@ def build_settings(args) -> LabelerSettings:
         validation_api_key=args.validation_api_key,
         validation_timeout=args.validation_timeout,
         validation_max_tokens=args.validation_max_tokens,
+        threads=args.threads,
         host=args.host,
         port=args.port,
+        allowed_root=args.allowed_root,
     )
 
 

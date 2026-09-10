@@ -8,6 +8,9 @@ import {
   parseTarget,
   serializeHtmlTable,
   serializeTarget,
+  splitOcrLine,
+  mergeOcrLine,
+  pasteOcrLines,
 } from "../../vl_layout_labeler/static/target_codec.mjs";
 
 test("OCR preserves line count, blank lines, and surrounding whitespace", () => {
@@ -109,4 +112,48 @@ test("invalid raw remains available while the codec reports why it cannot visual
   assert.equal(result.model, null);
   assert.match(result.error, /không dùng HTML/);
   assert.equal(raw, "<table><tr><td>A</td></tr></table>");
+});
+
+test("splitOcrLine splits line into two lines at cursor and returns next line focus", () => {
+  const initial = ["Dòng đầu tiên", "Dòng thứ hai"];
+  const atEnd = splitOcrLine(initial, 0, 13, 13);
+  assert.deepEqual(atEnd.lines, ["Dòng đầu tiên", "", "Dòng thứ hai"]);
+  assert.deepEqual(atEnd.focus, { index: 1, position: 0 });
+
+  const inMiddle = splitOcrLine(initial, 0, 5, 5);
+  assert.deepEqual(inMiddle.lines, ["Dòng ", "đầu tiên", "Dòng thứ hai"]);
+  assert.deepEqual(inMiddle.focus, { index: 1, position: 0 });
+
+  const atStart = splitOcrLine(initial, 0, 0, 0);
+  assert.deepEqual(atStart.lines, ["", "Dòng đầu tiên", "Dòng thứ hai"]);
+  assert.deepEqual(atStart.focus, { index: 1, position: 0 });
+
+  const withSelection = splitOcrLine(initial, 0, 4, 9);
+  assert.deepEqual(withSelection.lines, ["Dòng", "tiên", "Dòng thứ hai"]);
+  assert.deepEqual(withSelection.focus, { index: 1, position: 0 });
+});
+
+test("mergeOcrLine joins line with previous line and returns merge offset", () => {
+  const lines = ["Dòng ", "đầu tiên", "Dòng thứ ba"];
+  const merged = mergeOcrLine(lines, 1);
+  assert.deepEqual(merged.lines, ["Dòng đầu tiên", "Dòng thứ ba"]);
+  assert.deepEqual(merged.focus, { index: 0, position: 5 });
+});
+
+test("pasteOcrLines splits multiline paste into separate lines", () => {
+  const lines = ["Bắt đầu: ", "Kết thúc"];
+  const pasted = pasteOcrLines(lines, 0, 9, 9, "dòng 1\ndòng 2\ndòng 3");
+  assert.deepEqual(pasted.lines, ["Bắt đầu: dòng 1", "dòng 2", "dòng 3", "Kết thúc"]);
+  assert.deepEqual(pasted.focus, { index: 2, position: 6 });
+});
+
+test("pasteOcrLines pastes single-line and empty text without line duplication", () => {
+  const lines = ["hello world"];
+  const single = pasteOcrLines(lines, 0, 5, 5, " BEAUTIFUL");
+  assert.deepEqual(single.lines, ["hello BEAUTIFUL world"]);
+  assert.deepEqual(single.focus, { index: 0, position: 15 });
+
+  const empty = pasteOcrLines(lines, 0, 5, 5, "");
+  assert.deepEqual(empty.lines, ["hello world"]);
+  assert.deepEqual(empty.focus, { index: 0, position: 5 });
 });

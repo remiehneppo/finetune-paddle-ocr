@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field
-from threading import Lock
+from threading import BoundedSemaphore, Lock
 
 from batch_lifecycle import BatchLifecycleMixin
 from .batch_operations import DetectBatchOperation, PrelabelBatchOperation
@@ -31,13 +32,16 @@ class BatchSnapshot:
 
 
 class GPUCoordinator:
-    def __init__(self, layout_engine, vl_client):
+    def __init__(self, layout_engine, vl_client, max_workers: int = 1):
+        if max_workers <= 0:
+            raise ValueError("max_workers must be positive")
         self.layout_engine = layout_engine
         self.vl_client = vl_client
-        self._lock = Lock()
+        self.max_workers = max_workers
+        self._slots = BoundedSemaphore(max_workers)
 
     def detect(self, record):
-        with self._lock:
+        with self._slots:
             return self.layout_engine.detect(record)
 
     def prelabel(self, record, annotation, block_ids=None, replace_existing=True):
@@ -50,7 +54,7 @@ class GPUCoordinator:
                 raise ValueError("layout-only blocks cannot be prelabelled")
         blocks = []
         changed = False
-        with self._lock:
+        with self._slots:
             for block in annotation.blocks:
                 if selected is not None and block.id not in selected:
                     blocks.append(block)
@@ -78,9 +82,23 @@ class GPUCoordinator:
 
 
 class BatchManager(BatchLifecycleMixin):
-    def __init__(self, coordinator: GPUCoordinator, validation_service=None):
+    def __init__(
+        self,
+        coordinator: GPUCoordinator,
+        validation_service=None,
+        max_workers: int | None = None,
+    ):
+        if max_workers is not None:
+            resolved_workers = max_workers
+        elif isinstance(getattr(coordinator, "max_workers", None), int):
+            resolved_workers = coordinator.max_workers
+        else:
+            resolved_workers = 1
+        if resolved_workers <= 0:
+            raise ValueError("max_workers must be positive")
         self.coordinator = coordinator
         self.validation_service = validation_service
+        self.max_workers = resolved_workers
         self.operations = {
             "detect": DetectBatchOperation(coordinator),
             "prelabel": PrelabelBatchOperation(coordinator, validation_service),
@@ -105,22 +123,41 @@ class BatchManager(BatchLifecycleMixin):
             if not self._begin():
                 return
             operation_adapter = self.operations[operation]
-            for record in records:
-                if not self._claim(record.name):
-                    return
-                try:
-                    result = operation_adapter.execute(
-                        record, store, post_validate=post_validate
-                    )
-                    self._increment("processed" if result.processed else "skipped")
-                    if result.validation_error is not None:
-                        with self._state_lock:
-                            self._snapshot.validation_failed += 1
-                            self._snapshot.validation_errors.append(
-                                BatchError(record.name, result.validation_error)
-                            )
-                except Exception as exc:
-                    self._add_error(record.name, str(exc))
+            record_iterator = iter(records)
+            queue_lock = Lock()
+
+            def _worker():
+                active_record = None
+                while not self._cancel.is_set():
+                    with queue_lock:
+                        try:
+                            record = next(record_iterator)
+                        except StopIteration:
+                            break
+                    active_record = record
+                    if not self._claim(record.name):
+                        break
+                    try:
+                        result = operation_adapter.execute(
+                            record, store, post_validate=post_validate
+                        )
+                        self._increment("processed" if result.processed else "skipped")
+                        if result.validation_error is not None:
+                            with self._state_lock:
+                                self._snapshot.validation_failed += 1
+                                self._snapshot.validation_errors.append(
+                                    BatchError(record.name, result.validation_error)
+                                )
+                    except Exception as exc:
+                        self._add_error(active_record.name if active_record else record.name, str(exc))
+                    finally:
+                        active_record = None
+
+            worker_count = min(self.max_workers, len(records) or 1)
+            with ThreadPoolExecutor(max_workers=worker_count) as executor:
+                futures = [executor.submit(_worker) for _ in range(worker_count)]
+                for future in futures:
+                    future.result()
             self._finish()
         except Exception as exc:
             self._fail(exc)

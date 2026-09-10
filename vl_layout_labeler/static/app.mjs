@@ -3,7 +3,10 @@ import {
   cloneTargetModel,
   createStarterModel,
   inspectTarget,
+  mergeOcrLine,
+  pasteOcrLines,
   serializeTarget,
+  splitOcrLine,
 } from "./target_codec.mjs";
 import {
   appendValidationPreview,
@@ -13,13 +16,21 @@ import {
   validationIssueCount,
   validationSelectionRange,
 } from "./validation_ui.mjs";
+import {
+  fitCanvasView,
+  panCanvasView,
+  resizeRectangleEdge,
+  zoomCanvasView,
+} from "./canvas_geometry.mjs";
 
 const $ = (id) => document.getElementById(id);
 const svg = (name) => document.createElementNS("http://www.w3.org/2000/svg", name);
 const state = {
   images: [], current: null, currentId: null, selected: null,
-  view: { scale: 1, x: 0, y: 0 }, add: false, dirty: false, timer: null, drag: null,
+  view: { scale: 1, x: 0, y: 0 }, viewMode: "fit", add: false, dirty: false,
+  timer: null, drag: null, pan: null, spacePressed: false,
   targetMode: "visual", targetError: null, busy: null, batchBusy: null,
+  workspaceBusy: false, workspaceStartedAt: null, workspaceTimer: null,
   validationConfigured: false, validationEnabled: false,
 };
 
@@ -62,10 +73,37 @@ function setBatchBusy(action) {
   state.batchBusy = action;
   renderInteractionState();
 }
+function setWorkspaceBusy(busy, message = "Đang mở folder…") {
+  state.workspaceBusy = busy;
+  if (busy) {
+    state.workspaceStartedAt = Date.now();
+    clearInterval(state.workspaceTimer);
+    state.workspaceTimer = setInterval(renderWorkspaceStatus, 1000);
+  } else {
+    state.workspaceStartedAt = null;
+    clearInterval(state.workspaceTimer);
+    state.workspaceTimer = null;
+  }
+  $("open-folder").textContent = busy ? "Đang mở…" : "Mở folder";
+  $("workspace-message").textContent = message;
+  renderWorkspaceStatus();
+  renderInteractionState();
+}
+function renderWorkspaceStatus() {
+  const status = $("workspace-status");
+  const visible = state.workspaceBusy;
+  status.hidden = !visible;
+  if (!visible) return;
+  const elapsed = Math.max(0, Math.floor((Date.now() - state.workspaceStartedAt) / 1000));
+  if (elapsed >= 10 && $("workspace-message").textContent === "Đang mở folder…") {
+    $("workspace-message").textContent = "Vẫn đang mở folder, có thể folder khá lớn…";
+  }
+  $("workspace-elapsed").textContent = `${elapsed}s`;
+}
 function renderInteractionState() {
   const completed = isCompleted();
   const operation = currentOperation();
-  const processing = Boolean(operation);
+  const processing = Boolean(operation) || state.workspaceBusy;
   const noCurrent = !state.current;
   const block = selectedBlock();
   const operationStatus = $("operation-status");
@@ -91,6 +129,9 @@ function renderInteractionState() {
   $("cancel-batch").disabled = !state.batchBusy;
   $("open-folder").disabled = processing;
   $("folder-path").disabled = processing;
+  for (const id of ["page-fit", "page-actual", "page-zoom-out", "page-zoom-in"]) {
+    $(id).disabled = noCurrent;
+  }
   $("page-stage").classList.toggle("read-only", completed || Boolean(state.busy));
   $("page-stage").setAttribute("aria-busy", String(Boolean(state.busy)));
   document.querySelector(".canvas-panel").setAttribute("aria-busy", String(processing));
@@ -117,23 +158,88 @@ function rectangle(start, end) {
   return [[left, top], [right, top], [right, bottom], [left, bottom]];
 }
 
-function fitImage() {
+function updatePageZoomValue() {
+  $("page-zoom-value").textContent = state.viewMode === "fit"
+    ? "Fit"
+    : `${Math.round(state.view.scale * 100)}%`;
+}
+function renderResizeHandles(overlay, block) {
+  const points = block.polygon.map(imageToScreen);
+  const edges = [
+    ["top", 0, 1, "horizontal"],
+    ["right", 1, 2, "vertical"],
+    ["bottom", 2, 3, "horizontal"],
+    ["left", 3, 0, "vertical"],
+  ];
+  for (const [edge, startIndex, endIndex, orientation] of edges) {
+    const start = points[startIndex];
+    const end = points[endIndex];
+    const hit = svg("line");
+    hit.setAttribute("x1", start[0]);
+    hit.setAttribute("y1", start[1]);
+    hit.setAttribute("x2", end[0]);
+    hit.setAttribute("y2", end[1]);
+    hit.classList.add("edge-hit", orientation);
+    hit.onpointerdown = (event) => beginEdgeDrag(event, block, edge);
+    overlay.append(hit);
+
+    const grip = svg("rect");
+    const midpoint = [(start[0] + end[0]) / 2, (start[1] + end[1]) / 2];
+    const width = orientation === "horizontal" ? 28 : 8;
+    const height = orientation === "horizontal" ? 8 : 28;
+    grip.setAttribute("x", midpoint[0] - width / 2);
+    grip.setAttribute("y", midpoint[1] - height / 2);
+    grip.setAttribute("width", width);
+    grip.setAttribute("height", height);
+    grip.setAttribute("rx", 4);
+    grip.classList.add("edge-grip", orientation);
+    grip.onpointerdown = (event) => beginEdgeDrag(event, block, edge);
+    overlay.append(grip);
+  }
+  points.forEach(([x, y], index) => {
+    const corner = svg("circle");
+    corner.setAttribute("cx", x);
+    corner.setAttribute("cy", y);
+    corner.setAttribute("r", 6);
+    corner.classList.add("corner");
+    corner.onpointerdown = (event) => beginCornerDrag(event, block, index);
+    overlay.append(corner);
+  });
+}
+function renderCanvas() {
+  const overlay = $("overlay");
+  overlay.replaceChildren();
+  for (const block of state.current?.blocks || []) {
+    const polygon = svg("polygon");
+    polygon.setAttribute("points", block.polygon.map(imageToScreen).map((point) => point.join(",")).join(" "));
+    polygon.classList.add("bbox", block.task || "layout-only");
+    if (block.id === state.selected) polygon.classList.add("selected");
+    if (block.skipped) polygon.classList.add("skipped");
+    polygon.onclick = (event) => { event.stopPropagation(); state.selected = block.id; state.targetError = null; render(); };
+    polygon.onpointerdown = (event) => beginDrag(event, block);
+    overlay.append(polygon);
+    if (block.id === state.selected && !editingLocked()) renderResizeHandles(overlay, block);
+  }
+}
+function applyPageView() {
   const image = $("page-image");
-  const stage = $("page-stage");
-  if (!image.naturalWidth || !stage.clientWidth) return;
-  state.view.scale = Math.min(
-    stage.clientWidth / image.naturalWidth,
-    stage.clientHeight / image.naturalHeight,
-    1,
-  );
-  state.view.x = (stage.clientWidth - image.naturalWidth * state.view.scale) / 2;
-  state.view.y = (stage.clientHeight - image.naturalHeight * state.view.scale) / 2;
   Object.assign(image.style, {
     left: `${state.view.x}px`, top: `${state.view.y}px`,
     width: `${image.naturalWidth * state.view.scale}px`,
     height: `${image.naturalHeight * state.view.scale}px`,
   });
-  render();
+  updatePageZoomValue();
+  renderCanvas();
+}
+function fitImage() {
+  const image = $("page-image");
+  const stage = $("page-stage");
+  if (!image.naturalWidth || !stage.clientWidth) return;
+  state.view = fitCanvasView(
+    stage.clientWidth, stage.clientHeight, image.naturalWidth, image.naturalHeight,
+  );
+  state.viewMode = "fit";
+  applyPageView();
 }
 
 function renderImages() {
@@ -274,29 +380,132 @@ function commitVisualModel(task, model, { rerender = false } = {}) {
   }
 }
 
+let focusLineRequest = null;
+
+function autoResizeLineInput(textarea) {
+  if (!textarea) return;
+  textarea.style.height = "auto";
+  const nextHeight = Math.max(textarea.scrollHeight, 38);
+  textarea.style.height = `${nextHeight}px`;
+}
+
 function renderOcrEditor(container, model) {
   const list = element("div", "line-editor");
+  const isVertical = $("layout-label")?.value === "vertical_text";
+  if (!model.lines || model.lines.length === 0) {
+    model.lines = [""];
+  }
+
   model.lines.forEach((line, index) => {
     const row = element("div", "line-row");
     row.append(element("span", "line-number", String(index + 1)));
-    const input = element("input");
+    const input = element("textarea", "line-input");
     input.value = line;
+    input.rows = 1;
+    input.spellcheck = false;
     input.setAttribute("aria-label", `Dòng OCR ${index + 1}`);
+
+    const syncHeight = () => {
+      if (!isVertical) autoResizeLineInput(input);
+    };
+
     input.oninput = (event) => {
+      syncHeight();
       model.lines[index] = event.target.value;
       commitVisualModel("ocr", model);
     };
-    row.append(input, targetButton("Xóa", () => {
-      if (model.lines.length === 1) return;
-      model.lines.splice(index, 1);
+
+    input.onkeydown = (event) => {
+      if (event.isComposing || event.keyCode === 229) return;
+
+      if (event.key === "Enter") {
+        event.preventDefault();
+        const start = input.selectionStart ?? input.value.length;
+        const end = input.selectionEnd ?? start;
+        const result = splitOcrLine(model.lines, index, start, end);
+        model.lines = result.lines;
+        focusLineRequest = result.focus;
+        commitVisualModel("ocr", model, { rerender: true });
+        return;
+      }
+
+      if (
+        event.key === "Backspace"
+        && input.selectionStart === 0
+        && input.selectionEnd === 0
+        && index > 0
+      ) {
+        event.preventDefault();
+        const result = mergeOcrLine(model.lines, index);
+        model.lines = result.lines;
+        focusLineRequest = result.focus;
+        commitVisualModel("ocr", model, { rerender: true });
+        return;
+      }
+    };
+
+    input.onpaste = (event) => {
+      const pasteText = event.clipboardData?.getData("text") || "";
+      if (!pasteText.includes("\n")) return;
+      event.preventDefault();
+      const start = input.selectionStart ?? input.value.length;
+      const end = input.selectionEnd ?? start;
+      const result = pasteOcrLines(model.lines, index, start, end, pasteText);
+      model.lines = result.lines;
+      focusLineRequest = result.focus;
       commitVisualModel("ocr", model, { rerender: true });
-    }, "icon danger"));
+    };
+
+    row.append(
+      input,
+      targetButton(
+        "Xóa",
+        () => {
+          if (model.lines.length === 1) return;
+          const targetIndex = index > 0 ? index - 1 : 0;
+          const targetLine = index > 0 ? (model.lines[index - 1] || "") : (model.lines[1] || "");
+          focusLineRequest = {
+            index: targetIndex,
+            position: targetLine.length,
+          };
+          model.lines.splice(index, 1);
+          commitVisualModel("ocr", model, { rerender: true });
+        },
+        "icon danger",
+      ),
+    );
     list.append(row);
+
+    requestAnimationFrame(syncHeight);
+
+    if (focusLineRequest && focusLineRequest.index === index) {
+      const { position } = focusLineRequest;
+      focusLineRequest = null;
+      requestAnimationFrame(() => {
+        input.focus();
+        if (typeof input.setSelectionRange === "function") {
+          input.setSelectionRange(position, position);
+        }
+        syncHeight();
+        if (typeof input.scrollIntoView === "function") {
+          input.scrollIntoView({ block: "nearest" });
+        }
+      });
+    }
   });
-  container.append(list, targetButton("+ Thêm dòng", () => {
-    model.lines.push("");
-    commitVisualModel("ocr", model, { rerender: true });
-  }));
+
+  if (focusLineRequest) {
+    focusLineRequest = null;
+  }
+
+  container.append(
+    list,
+    targetButton("+ Thêm dòng", () => {
+      focusLineRequest = { index: model.lines.length, position: 0 };
+      model.lines.push("");
+      commitVisualModel("ocr", model, { rerender: true });
+    }),
+  );
 }
 
 function renderFormulaEditor(container, model) {
@@ -619,29 +828,7 @@ function renderTargetEditor() {
 function render() {
   renderBlocks();
   renderInspector();
-  const overlay = $("overlay");
-  overlay.replaceChildren();
-  for (const block of state.current?.blocks || []) {
-    const element = svg("polygon");
-    element.setAttribute("points", block.polygon.map(imageToScreen).map((point) => point.join(",")).join(" "));
-    element.classList.add("bbox", block.task || "layout-only");
-    if (block.id === state.selected) element.classList.add("selected");
-    if (block.skipped) element.classList.add("skipped");
-    element.onclick = (event) => { event.stopPropagation(); state.selected = block.id; state.targetError = null; render(); };
-    element.onpointerdown = (event) => beginDrag(event, block);
-    overlay.append(element);
-    if (block.id === state.selected && !editingLocked()) {
-      block.polygon.map(imageToScreen).forEach(([x, y], index) => {
-        const corner = svg("circle");
-        corner.setAttribute("cx", x);
-        corner.setAttribute("cy", y);
-        corner.setAttribute("r", 6);
-        corner.classList.add("corner");
-        corner.onpointerdown = (event) => beginCornerDrag(event, block, index);
-        overlay.append(corner);
-      });
-    }
-  }
+  renderCanvas();
   renderInteractionState();
 }
 
@@ -734,8 +921,12 @@ function eventPoint(event) {
   const bounds = $("page-stage").getBoundingClientRect();
   return screenToImage([event.clientX - bounds.left, event.clientY - bounds.top]);
 }
+function stagePoint(event) {
+  const bounds = $("page-stage").getBoundingClientRect();
+  return [event.clientX - bounds.left, event.clientY - bounds.top];
+}
 function beginDrag(event, block) {
-  if (state.add || editingLocked()) return;
+  if (event.button !== 0 || state.spacePressed || state.add || editingLocked()) return;
   event.preventDefault();
   const activeBlock = blockById(block.id);
   if (!activeBlock) return;
@@ -752,12 +943,26 @@ function beginDrag(event, block) {
   };
 }
 function beginCornerDrag(event, block, corner) {
-  if (editingLocked()) return;
+  if (event.button !== 0 || state.spacePressed || editingLocked()) return;
   event.preventDefault();
   event.stopPropagation();
   const activeBlock = blockById(block.id);
   if (!activeBlock) return;
   state.drag = { block: activeBlock, corner, pending: null, frame: null };
+}
+function beginEdgeDrag(event, block, edge) {
+  if (event.button !== 0 || state.spacePressed || editingLocked()) return;
+  event.preventDefault();
+  event.stopPropagation();
+  const activeBlock = blockById(block.id);
+  if (!activeBlock) return;
+  state.drag = {
+    block: activeBlock,
+    edge,
+    original: activeBlock.polygon.map((point) => [...point]),
+    pending: null,
+    frame: null,
+  };
 }
 function renderDraggedBlock(block) {
   const polygon = $("overlay").querySelector(".bbox.selected");
@@ -770,6 +975,34 @@ function renderDraggedBlock(block) {
     corner.setAttribute("cx", point[0]);
     corner.setAttribute("cy", point[1]);
   });
+  const edges = [
+    [0, 1, "horizontal"],
+    [1, 2, "vertical"],
+    [2, 3, "horizontal"],
+    [3, 0, "vertical"],
+  ];
+  const hits = $("overlay").querySelectorAll(".edge-hit");
+  const grips = $("overlay").querySelectorAll(".edge-grip");
+  edges.forEach(([startIndex, endIndex, orientation], edgeIndex) => {
+    const start = points[startIndex];
+    const end = points[endIndex];
+    if (!start || !end) return;
+    const hit = hits[edgeIndex];
+    if (hit) {
+      hit.setAttribute("x1", start[0]);
+      hit.setAttribute("y1", start[1]);
+      hit.setAttribute("x2", end[0]);
+      hit.setAttribute("y2", end[1]);
+    }
+    const grip = grips[edgeIndex];
+    if (grip) {
+      const midpoint = [(start[0] + end[0]) / 2, (start[1] + end[1]) / 2];
+      const width = orientation === "horizontal" ? 28 : 8;
+      const height = orientation === "horizontal" ? 8 : 28;
+      grip.setAttribute("x", midpoint[0] - width / 2);
+      grip.setAttribute("y", midpoint[1] - height / 2);
+    }
+  });
 }
 function applyDragPoint(point) {
   if (!state.drag || !point) return;
@@ -778,6 +1011,14 @@ function applyDragPoint(point) {
       Math.max(0, Math.min(state.current.image.width - 1, point[0])),
       Math.max(0, Math.min(state.current.image.height - 1, point[1])),
     ];
+  } else if (state.drag.edge !== undefined) {
+    state.drag.block.polygon = resizeRectangleEdge(
+      state.drag.original,
+      state.drag.edge,
+      point,
+      state.current.image.width,
+      state.current.image.height,
+    );
   } else {
     const dx = point[0] - state.drag.start[0];
     const dy = point[1] - state.drag.start[1];
@@ -802,21 +1043,67 @@ function scheduleDragFrame(point) {
     state.drag.frame = requestAnimationFrame(flushDragFrame);
   }
 }
+let panFrame = null;
+function schedulePanFrame() {
+  if (panFrame !== null) return;
+  panFrame = requestAnimationFrame(() => {
+    panFrame = null;
+    applyPageView();
+  });
+}
 window.addEventListener("pointermove", (event) => {
-  if (!state.drag) return;
-  scheduleDragFrame(eventPoint(event));
+  if (state.pan) {
+    const point = stagePoint(event);
+    state.view = panCanvasView(
+      state.pan.view,
+      point[0] - state.pan.start[0],
+      point[1] - state.pan.start[1],
+    );
+    state.viewMode = "custom";
+    schedulePanFrame();
+    return;
+  }
+  if (state.drag) scheduleDragFrame(eventPoint(event));
 });
 window.addEventListener("pointerup", (event) => {
+  if (state.pan) {
+    if (panFrame !== null) {
+      cancelAnimationFrame(panFrame);
+      panFrame = null;
+      applyPageView();
+    }
+    state.pan = null;
+    $("page-stage").classList.remove("panning");
+    return;
+  }
   if (state.drag) {
     if (state.drag.frame !== null) cancelAnimationFrame(state.drag.frame);
     applyDragPoint(eventPoint(event));
     state.drag.block.source = "manual";
     state.drag.block.score = null;
     state.drag = null;
+    const metaEl = $("block-meta");
+    if (metaEl) metaEl.textContent = "manual";
     markDirty();
   }
 });
+window.addEventListener("pointercancel", () => {
+  if (panFrame !== null) {
+    cancelAnimationFrame(panFrame);
+    panFrame = null;
+  }
+  state.pan = null;
+  $("page-stage").classList.remove("panning");
+});
 $("page-stage").onpointerdown = (event) => {
+  const shouldPan = event.button === 1 || (event.button === 0 && state.spacePressed);
+  if (shouldPan) {
+    event.preventDefault();
+    state.pan = { start: stagePoint(event), view: { ...state.view } };
+    $("page-stage").classList.add("panning");
+    if ($("page-stage").setPointerCapture) $("page-stage").setPointerCapture(event.pointerId);
+    return;
+  }
   if (editingLocked() || !state.add || event.target !== $("overlay")) return;
   event.preventDefault();
   const stage = $("page-stage");
@@ -913,26 +1200,80 @@ async function pollBatch(snapshot) {
     setStatus(`Batch ${snapshot.state}`);
   }
 }
+function setExportStatus(message, type = "loading") {
+  const el = $("export-status");
+  if (!el) return;
+  if (!message) {
+    el.hidden = true;
+    el.textContent = "";
+    el.className = "export-status";
+    return;
+  }
+  el.hidden = false;
+  el.className = `export-status ${type}`;
+  el.textContent = message;
+}
+
 async function exportDataset(endpoint, label) {
   if (!(await save())) return;
+  const pathInput = $("export-path");
+  const rawPath = pathInput.value.trim() || pathInput.placeholder.trim();
+  if (!rawPath) {
+    setExportStatus("Vui lòng nhập đường dẫn thư mục xuất", "danger");
+    setStatus("Lỗi: thiếu đường dẫn xuất");
+    return;
+  }
+  const exportButtons = [
+    $("export-hf"),
+    $("export-layout"),
+    $("export-all"),
+  ].filter(Boolean);
+  exportButtons.forEach((btn) => (btn.disabled = true));
+  setExportStatus(`Đang xuất ${label}…`, "loading");
+  setStatus(`Đang xuất ${label}…`);
   try {
     const result = await api(endpoint, {
-      method: "POST", body: JSON.stringify({ output_dir: $("export-path").value }),
+      method: "POST", body: JSON.stringify({ output_dir: rawPath }),
     });
+    const count = result.samples ?? result.annotations ?? 0;
+    const pages = result.pages ?? 0;
+    const msg = `✓ ${label} thành công: ${count} mẫu (${pages} trang) tại ${result.path}`;
+    setExportStatus(msg, "success");
     setStatus(`${label}: ${result.path}`);
   } catch (error) {
+    setExportStatus(`⚠️ Lỗi export: ${error.message}`, "danger");
     setStatus(`Lỗi export: ${error.message}`);
+  } finally {
+    exportButtons.forEach((btn) => (btn.disabled = false));
   }
 }
 
 $("open-folder").onclick = async () => {
+  const path = $("folder-path").value.trim();
+  if (!path) {
+    setStatus("Lỗi: hãy nhập đường dẫn folder");
+    $("folder-path").focus();
+    return;
+  }
+  setWorkspaceBusy(true, "Đang mở folder…");
+  setStatus("Đang kết nối workspace…");
   try {
-    await api("/api/workspace/open", { method: "POST", body: JSON.stringify({ path: $("folder-path").value }) });
+    await api("/api/workspace/open", { method: "POST", body: JSON.stringify({ path }) });
+    $("workspace-message").textContent = "Đã mở folder, đang đọc danh sách ảnh…";
+    setStatus("Đang đọc danh sách ảnh…");
     state.current = null;
     state.currentId = null;
     await loadImages();
+    if (!state.images.length) {
+      setStatus("Folder đã mở nhưng không có ảnh hợp lệ");
+      return;
+    }
     setStatus("Workspace đã mở");
-  } catch (error) { setStatus(`Lỗi: ${error.message}`); }
+  } catch (error) {
+    setStatus(`Lỗi mở folder: ${error.message}`);
+  } finally {
+    setWorkspaceBusy(false);
+  }
 };
 $("detect-current").onclick = () => runCurrent("detect", { replace_existing: true });
 $("prelabel-page").onclick = () => runCurrent("prelabel", {
@@ -1016,7 +1357,66 @@ $("cancel-batch").onclick = async () => pollBatch(await api("/api/batch", { meth
 $("export-hf").onclick = () => exportDataset("/api/export/hf", "HF export");
 $("export-layout").onclick = () => exportDataset("/api/export/layout", "Layout export");
 $("export-all").onclick = () => exportDataset("/api/export/all", "Export All");
-window.addEventListener("resize", fitImage);
+function setPageScale(scale, anchor = null) {
+  const stage = $("page-stage");
+  if (!state.current || !stage.clientWidth) return;
+  state.view = zoomCanvasView(
+    state.view,
+    anchor || [stage.clientWidth / 2, stage.clientHeight / 2],
+    scale,
+  );
+  state.viewMode = "custom";
+  applyPageView();
+}
+$("page-fit").onclick = fitImage;
+$("page-actual").onclick = () => setPageScale(1);
+$("page-zoom-out").onclick = () => setPageScale(state.view.scale / 1.25);
+$("page-zoom-in").onclick = () => setPageScale(state.view.scale * 1.25);
+let wheelFrame = null;
+let pendingScale = null;
+let pendingAnchor = null;
+$("page-stage").addEventListener("wheel", (event) => {
+  if (!state.current) return;
+  event.preventDefault();
+  const factor = Math.exp(-event.deltaY * 0.0015);
+  pendingScale = (pendingScale ?? state.view.scale) * factor;
+  pendingAnchor = stagePoint(event);
+  if (wheelFrame === null) {
+    wheelFrame = requestAnimationFrame(() => {
+      wheelFrame = null;
+      if (pendingScale !== null) {
+        setPageScale(pendingScale, pendingAnchor);
+        pendingScale = null;
+        pendingAnchor = null;
+      }
+    });
+  }
+}, { passive: false });
+window.addEventListener("keydown", (event) => {
+  if (event.code !== "Space" || event.repeat) return;
+  const target = event.target;
+  if (target instanceof HTMLInputElement
+      || target instanceof HTMLTextAreaElement
+      || target instanceof HTMLSelectElement
+      || target instanceof HTMLButtonElement) return;
+  event.preventDefault();
+  state.spacePressed = true;
+  $("page-stage").classList.add("pan-ready");
+});
+window.addEventListener("keyup", (event) => {
+  if (event.code !== "Space") return;
+  state.spacePressed = false;
+  $("page-stage").classList.remove("pan-ready");
+});
+window.addEventListener("blur", () => {
+  state.spacePressed = false;
+  state.pan = null;
+  $("page-stage").classList.remove("pan-ready", "panning");
+});
+window.addEventListener("resize", () => {
+  if (state.viewMode === "fit") fitImage();
+  else applyPageView();
+});
 
 const [taxonomy, health] = await Promise.all([api("/api/taxonomy"), api("/api/health")]);
 state.validationConfigured = Boolean(health.post_validation?.configured);

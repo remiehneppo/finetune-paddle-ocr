@@ -967,6 +967,7 @@ def create_resolved_config(
         "image_dtype": "float32",
         "min_pixels": args.min_pixels,
         "max_pixels": args.max_pixels,
+        "variable_resolution": 1,
         "model_name_or_path": args.model,
         "fine_tuning": "LoRA",
         "lora_rank": args.lora_rank,

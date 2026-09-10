@@ -552,6 +552,11 @@ class VLLayoutLabelerTests(unittest.TestCase):
         script = Path("vl_layout_labeler/static/app.mjs").read_text(encoding="utf-8")
         for element_id in (
             "layout-label",
+            "page-fit",
+            "page-actual",
+            "page-zoom-out",
+            "page-zoom-value",
+            "page-zoom-in",
             "target-editor",
             "visual-tab",
             "raw-tab",
@@ -564,6 +569,10 @@ class VLLayoutLabelerTests(unittest.TestCase):
             self.assertIn(f'id="{element_id}"', html)
         self.assertIn("Không xuất VL", html)
         self.assertIn('from "./target_codec.mjs"', script)
+        self.assertIn('from "./canvas_geometry.mjs"', script)
+        self.assertIn('classList.add("edge-hit", orientation)', script)
+        self.assertIn('classList.add("edge-grip", orientation)', script)
+        self.assertIn('addEventListener("wheel"', script)
         self.assertIn("inspectTarget(block.task, block.text)", script)
         self.assertIn("holder.rowSpan = cell.rowspan", script)
         self.assertIn("holder.colSpan = cell.colspan", script)
@@ -623,6 +632,199 @@ class VLLayoutLabelerTests(unittest.TestCase):
             self.assertEqual(export_hf.call_count, 2)
             export_layout.assert_called_once()
             export_all.assert_called_once()
+
+    def test_cli_threads_argument_and_settings_validation(self):
+        from vl_layout_labeler.cli import build_settings, parse_args
+
+        defaults = build_settings(parse_args([]))
+        self.assertEqual(defaults.threads, 10)
+
+        custom_short = build_settings(parse_args(["-t", "4"]))
+        self.assertEqual(custom_short.threads, 4)
+
+        custom_long = build_settings(parse_args(["--threads", "16"]))
+        self.assertEqual(custom_long.threads, 16)
+
+        with self.assertRaisesRegex(ValueError, "threads must be positive"):
+            LabelerSettings(threads=0).validate(require_runtime_models=False)
+
+        with self.assertRaisesRegex(ValueError, "threads must be positive"):
+            LabelerSettings(threads=-2).validate(require_runtime_models=False)
+
+    def test_cli_host_argument_and_settings_validation(self):
+        from vl_layout_labeler.cli import build_settings, parse_args
+
+        for host in (
+            "0.0.0.0",
+            "::",
+            "192.168.1.5",
+            "example.com",
+            "127.0.0.1",
+            "localhost",
+        ):
+            with self.subTest(host=host):
+                custom = build_settings(parse_args(["--host", host]))
+                self.assertEqual(custom.host, host)
+                validated = LabelerSettings(host=host).validate(require_runtime_models=False)
+                self.assertEqual(validated.host, host)
+
+        for invalid in ("", "   "):
+            with self.subTest(host=invalid):
+                with self.assertRaisesRegex(ValueError, "host must not be empty"):
+                    LabelerSettings(host=invalid).validate(require_runtime_models=False)
+
+        for invalid_format in (":::", "invalid host name"):
+            with self.subTest(host=invalid_format):
+                with self.assertRaisesRegex(ValueError, "host must be a valid IP address or hostname"):
+                    LabelerSettings(host=invalid_format).validate(require_runtime_models=False)
+
+    def test_cli_allowed_root_argument_and_workspace_confinement(self):
+        from vl_layout_labeler.cli import build_settings, parse_args
+        from fastapi.testclient import TestClient
+        from unittest.mock import Mock
+
+        with tempfile.TemporaryDirectory() as base_dir:
+            base = Path(base_dir)
+            allowed = base / "allowed"
+            allowed.mkdir()
+            outside = base / "outside"
+            outside.mkdir()
+
+            cli_settings = build_settings(parse_args(["--allowed-root", str(allowed)]))
+            self.assertEqual(cli_settings.allowed_root, allowed)
+
+            app = create_app(
+                LabelerSettings(allowed_root=allowed).validate(require_runtime_models=False),
+                layout_engine=Mock(),
+                vl_client=Mock(),
+            )
+            with TestClient(app) as client:
+                res_outside = client.post("/api/workspace/open", json={"path": str(outside)})
+                self.assertEqual(res_outside.status_code, 403)
+                self.assertIn("outside the allowed root", res_outside.json()["detail"])
+
+                res_inside = client.post("/api/workspace/open", json={"path": str(allowed)})
+                self.assertEqual(res_inside.status_code, 200)
+
+    def test_layout_detection_engine_synchronizes_pipeline_predict(self):
+        from concurrent.futures import ThreadPoolExecutor
+        from vl_layout_labeler.catalog import ImageRecord
+        from vl_layout_labeler.layout_engine import LayoutDetectionEngine
+        from threading import Lock as TLock
+
+        active = 0
+        max_active = 0
+        lock = TLock()
+
+        class MockPipeline:
+            def predict(self, path):
+                nonlocal active, max_active
+                with lock:
+                    active += 1
+                    max_active = max(max_active, active)
+                time.sleep(0.01)
+                with lock:
+                    active -= 1
+                return [{"boxes": []}]
+
+        engine = LayoutDetectionEngine(Mock(), MockPipeline())
+        with tempfile.TemporaryDirectory() as temp_dir:
+            img_path = Path(temp_dir) / "test.png"
+            Image.new("RGB", (10, 10), "white").save(img_path)
+            rec = ImageRecord("id1", "test.png", img_path, "test.png", 10, 10, "0" * 64, 100, 100)
+
+            with ThreadPoolExecutor(max_workers=4) as executor:
+                list(executor.map(lambda _: engine.detect(rec), range(8)))
+
+            self.assertEqual(max_active, 1)
+
+    def test_batch_parallel_detect_and_prelabel_concurrency(self):
+        from threading import Lock as TLock
+        active_detect = 0
+        max_active_detect = 0
+        detect_lock = TLock()
+
+        active_prelabel = 0
+        max_active_prelabel = 0
+        prelabel_lock = TLock()
+
+        class ParallelLayout:
+            def detect(self, record):
+                nonlocal active_detect, max_active_detect
+                with detect_lock:
+                    active_detect += 1
+                    max_active_detect = max(max_active_detect, active_detect)
+                time.sleep(0.02)
+                with detect_lock:
+                    active_detect -= 1
+                return Annotation(
+                    image=ImageInfo(
+                        path=record.relative_path,
+                        width=record.width,
+                        height=record.height,
+                        sha256=record.sha256,
+                    ),
+                    status="detected",
+                    blocks=[
+                        Block(
+                            order=0,
+                            polygon=[(1, 1), (10, 1), (10, 8), (1, 8)],
+                            layout_label="text",
+                            task="ocr",
+                        )
+                    ],
+                )
+
+        class ParallelVL:
+            def prelabel(self, path, polygon, task, width, height):
+                nonlocal active_prelabel, max_active_prelabel
+                with prelabel_lock:
+                    active_prelabel += 1
+                    max_active_prelabel = max(max_active_prelabel, active_prelabel)
+                time.sleep(0.02)
+                with prelabel_lock:
+                    active_prelabel -= 1
+                return "recognized text"
+
+        coordinator = GPUCoordinator(ParallelLayout(), ParallelVL(), max_workers=4)
+        manager = BatchManager(coordinator, max_workers=4)
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for i in range(6):
+                Image.new("RGB", (20, 10), "white").save(root / f"page_{i}.png")
+            catalog = WorkspaceCatalog.open(root)
+            store = AnnotationStore(root)
+
+            manager.start("detect", catalog, store)
+            for _ in range(200):
+                if manager.snapshot().state == "completed":
+                    break
+                time.sleep(0.005)
+            snapshot_detect = manager.snapshot()
+            self.assertEqual(snapshot_detect.state, "completed")
+            self.assertEqual(snapshot_detect.processed, 6)
+            self.assertGreater(max_active_detect, 1)
+
+            manager.start("prelabel", catalog, store)
+            for _ in range(200):
+                if manager.snapshot().state == "completed":
+                    break
+                time.sleep(0.005)
+            snapshot_prelabel = manager.snapshot()
+            self.assertEqual(snapshot_prelabel.state, "completed")
+            self.assertEqual(snapshot_prelabel.processed, 6)
+            self.assertGreater(max_active_prelabel, 1)
+
+    def test_app_wires_threads_to_coordinator_and_batch(self):
+        settings = LabelerSettings(threads=7).validate(require_runtime_models=False)
+        app = create_app(
+            settings,
+            layout_engine=Mock(),
+            vl_client=Mock(),
+        )
+        self.assertEqual(app.state.labeler.coordinator.max_workers, 7)
+        self.assertEqual(app.state.labeler.batch.max_workers, 7)
 
 
 if __name__ == "__main__":

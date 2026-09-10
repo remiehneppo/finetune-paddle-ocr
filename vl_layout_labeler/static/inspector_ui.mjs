@@ -146,6 +146,12 @@ function enhanceEditorPresentation() {
     textarea.rows = clamp(lines.length, 2, 8);
     textarea.cols = clamp(Math.max(...lines.map((line) => line.length), 8), 12, 36);
   }
+  if (!visualEditor.classList.contains("vertical-text-mode")) {
+    for (const textarea of visualEditor.querySelectorAll(".line-input")) {
+      textarea.style.height = "auto";
+      textarea.style.height = `${Math.max(textarea.scrollHeight, 38)}px`;
+    }
+  }
 }
 
 function refresh() {

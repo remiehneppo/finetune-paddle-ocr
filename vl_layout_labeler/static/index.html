@@ -13,6 +13,11 @@
     <div class="toolbar">
       <input id="folder-path" placeholder="Đường dẫn folder ảnh" />
       <button id="open-folder">Mở folder</button>
+      <span id="workspace-status" class="workspace-status" role="status" aria-live="polite" hidden>
+        <span class="spinner" aria-hidden="true"></span>
+        <span id="workspace-message">Đang mở folder…</span>
+        <span id="workspace-elapsed" class="workspace-elapsed">0s</span>
+      </span>
       <span id="save-status">Chưa mở workspace</span>
     </div>
   </header>
@@ -24,10 +29,10 @@
       <ol id="image-list"></ol>
     </aside>
     <section class="canvas-panel">
-      <div class="canvas-toolbar"><span id="current-name">Chọn ảnh</span><button id="detect-current">Detect ảnh</button><button id="prelabel-page">Prelabel ảnh</button><button id="prelabel-current">Prelabel chọn</button><label class="validation-toggle"><input id="llm-validation" type="checkbox" /> LLM validation</label><button id="validate-current" class="secondary">Chạy lại validation</button><button id="add-mode">Thêm bbox</button><button id="complete-current">Complete</button><button id="reopen-current" class="secondary" hidden>Mở lại chỉnh sửa</button></div>
+      <div class="canvas-toolbar"><span id="current-name">Chọn ảnh</span><div class="page-zoom-controls" aria-label="Điều khiển ảnh gốc"><button id="page-fit" type="button">Fit</button><button id="page-actual" type="button">100%</button><button id="page-zoom-out" type="button" aria-label="Thu nhỏ ảnh gốc">−</button><span id="page-zoom-value">Fit</span><button id="page-zoom-in" type="button" aria-label="Phóng to ảnh gốc">+</button></div><button id="detect-current">Detect ảnh</button><button id="prelabel-page">Prelabel ảnh</button><button id="prelabel-current">Prelabel chọn</button><label class="validation-toggle"><input id="llm-validation" type="checkbox" /> LLM validation</label><button id="validate-current" class="secondary">Chạy lại validation</button><button id="add-mode">Thêm bbox</button><button id="complete-current">Complete</button><button id="reopen-current" class="secondary" hidden>Mở lại chỉnh sửa</button></div>
       <div id="operation-status" class="operation-status" role="status" aria-live="polite" hidden><span class="spinner" aria-hidden="true"></span><span id="operation-message">Model đang xử lý…</span></div>
       <div id="completed-banner" class="completed-banner" role="status" aria-live="polite" hidden><strong>✓ Ảnh đã Complete</strong><span>Chỉnh sửa đang bị khóa. Nhấn “Mở lại chỉnh sửa” nếu cần thay đổi output.</span></div>
-      <div id="page-stage" tabindex="0"><img id="page-image" alt="Trang tài liệu" /><svg id="overlay"></svg></div>
+      <div id="page-stage" tabindex="0" aria-label="Ảnh gốc. Lăn chuột để zoom; giữ Space và kéo hoặc kéo chuột giữa để di chuyển."><img id="page-image" alt="Trang tài liệu" draggable="false" /><svg id="overlay"></svg></div>
     </section>
     <div id="inspector-separator" class="pane-separator" role="separator" aria-label="Điều chỉnh chiều rộng inspector" aria-orientation="vertical" aria-valuemin="340" aria-valuemax="760" aria-valuenow="440" tabindex="0"></div>
     <aside class="inspector">
@@ -90,7 +95,7 @@
           </div>
         </div>
       </div>
-      <details class="export-box"><summary>Xuất dữ liệu</summary><label>Output folder<input id="export-path" placeholder="/tmp/document-layout-export" /></label><div class="export-actions"><button id="export-hf">Export HF</button><button id="export-layout">Export Layout</button><button id="export-all">Export All</button></div></details>
+      <details class="export-box"><summary>Xuất dữ liệu</summary><label>Output folder<input id="export-path" placeholder="/tmp/document-layout-export" /></label><div class="export-actions"><button id="export-hf">Export HF</button><button id="export-layout">Export Layout</button><button id="export-all">Export All</button></div><div id="export-status" class="export-status" hidden></div></details>
     </aside>
   </main>
   <script type="module" src="/static/app.mjs"></script>

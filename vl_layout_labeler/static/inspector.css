@@ -246,6 +246,9 @@
 #text,
 .formula-input {
   resize: none;
+  white-space: pre-wrap;
+  word-break: break-word;
+  overflow-wrap: anywhere;
 }
 
 .line-editor {
@@ -254,10 +257,31 @@
   padding: 3px;
 }
 
+.line-row {
+  align-items: flex-start;
+}
+
+.line-row .line-number {
+  padding-top: 8px;
+}
+
+.line-row .icon.danger {
+  margin-top: 4px;
+}
+
+.line-row textarea,
 .line-row input {
   min-height: 38px;
-  padding: 9px 10px;
-  line-height: 1.65;
+  padding: 8px 10px;
+  line-height: 1.6;
+  font-family: inherit;
+  font-size: 13px;
+  box-sizing: border-box;
+  white-space: pre-wrap;
+  word-break: break-word;
+  overflow-wrap: anywhere;
+  resize: vertical;
+  field-sizing: content;
 }
 
 #visual-editor.vertical-text-mode .line-editor {
@@ -274,11 +298,16 @@
   flex-direction: column;
 }
 
+#visual-editor.vertical-text-mode .line-row textarea,
 #visual-editor.vertical-text-mode .line-row input {
   width: 44px;
   min-height: 205px;
   writing-mode: vertical-rl;
   text-orientation: upright;
+  white-space: pre-wrap;
+  word-break: break-word;
+  overflow-wrap: anywhere;
+  resize: none;
 }
 
 .table-scroll {

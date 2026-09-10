@@ -1,8 +1,21 @@
 from dataclasses import dataclass
-import ipaddress
 from pathlib import Path
+import ipaddress
 import re
 from typing import Literal
+
+def _is_valid_host(host: str) -> bool:
+    if host == "localhost":
+        return True
+    try:
+        ipaddress.ip_address(host)
+        return True
+    except ValueError:
+        pass
+    if len(host) > 253:
+        return False
+    allowed = re.compile(r"^(?!-)[A-Z0-9-]{1,63}(?<!-)$", re.IGNORECASE)
+    return all(allowed.match(part) for part in host.split("."))
 
 
 @dataclass(frozen=True)
@@ -74,15 +87,10 @@ class LabelerSettings:
             raise ValueError("text_det_unclip_ratio must be positive")
         if self.device != "cpu" and re.fullmatch(r"gpu:[0-9]+", self.device) is None:
             raise ValueError("device must be cpu or gpu:<index>")
-        if self.host != "localhost":
-            try:
-                host_address = ipaddress.ip_address(self.host)
-            except ValueError as exc:
-                raise ValueError(
-                    "host must be localhost or a loopback address"
-                ) from exc
-            if not host_address.is_loopback:
-                raise ValueError("host must be localhost or a loopback address")
+        if not self.host or not self.host.strip():
+            raise ValueError("host must not be empty")
+        if not _is_valid_host(self.host.strip()):
+            raise ValueError("host must be a valid IP address or hostname")
         if not 1 <= self.port <= 65535:
             raise ValueError("port must be between 1 and 65535")
         return self
