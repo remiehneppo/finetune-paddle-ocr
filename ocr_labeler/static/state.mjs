@@ -154,9 +154,14 @@ export function undo(state) {
   if (state.undoStack.length === 0) return state;
   const annotation = clone(state.undoStack.at(-1));
   annotation.revision = state.annotation.revision;
+  annotation.updated_at = state.annotation.updated_at ?? annotation.updated_at;
+  const selectedId = annotation.blocks.some((b) => b.id === state.selectedId)
+    ? state.selectedId
+    : null;
   return {
     ...state,
     annotation,
+    selectedId,
     undoStack: state.undoStack.slice(0, -1),
     redoStack: [...state.redoStack, clone(state.annotation)],
     dirty: true,
@@ -167,9 +172,14 @@ export function redo(state) {
   if (state.redoStack.length === 0) return state;
   const annotation = clone(state.redoStack.at(-1));
   annotation.revision = state.annotation.revision;
+  annotation.updated_at = state.annotation.updated_at ?? annotation.updated_at;
+  const selectedId = annotation.blocks.some((b) => b.id === state.selectedId)
+    ? state.selectedId
+    : null;
   return {
     ...state,
     annotation,
+    selectedId,
     undoStack: [...state.undoStack, clone(state.annotation)],
     redoStack: state.redoStack.slice(0, -1),
     dirty: true,

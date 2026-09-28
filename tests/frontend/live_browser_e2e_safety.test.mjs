@@ -4,10 +4,17 @@ import os from "node:os";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
 import { createRequire } from "node:module";
+import { fileURLToPath } from "node:url";
 import test from "node:test";
 
-const harness = path.resolve(
-  ".superpowers/sdd/2026-07-31-paddleocr-labeler-service/live_browser_e2e.cjs",
+const harness = fileURLToPath(
+  new URL(
+    "../../.superpowers/sdd/2026-07-31-paddleocr-labeler-service/live_browser_e2e.cjs",
+    import.meta.url,
+  ),
+);
+const stylesCssPath = fileURLToPath(
+  new URL("../../ocr_labeler/static/styles.css", import.meta.url),
 );
 const expectedNames = Array.from(
   { length: 10 },
@@ -17,7 +24,7 @@ const { createTemporaryWorkspace, openWorkspace } = createRequire(import.meta.ur
 
 test("application shell uses the visible dynamic viewport without fixed header subtraction", () => {
   const css = fs.readFileSync(
-    path.resolve("ocr_labeler/static/styles.css"),
+    stylesCssPath,
     "utf8",
   );
   const bodyRule = css.match(/body\s*\{([^}]*)\}/s)?.[1] ?? "";
@@ -87,6 +94,7 @@ test("temporary browser workspace copies only expected images and cleans its exa
         LABELER_E2E_WORKSPACE: arbitraryWorkspace,
       },
     });
+    assert.ifError(result.error);
     assert.equal(result.status, 0, result.stderr || result.stdout);
   } finally {
     fs.rmSync(source, { recursive: true, force: true });
@@ -190,7 +198,9 @@ test("cleanup unlinks a dangling replacement symlink without following its targe
     assert.equal(existsWithoutFollowing(absentTarget), false);
     assert.deepEqual(fs.readdirSync(renamedOriginal).sort(), expectedNames);
   } finally {
-    if (existsWithoutFollowing(lease.path)) fs.unlinkSync(lease.path);
+    if (existsWithoutFollowing(lease.path)) {
+      fs.rmSync(lease.path, { recursive: true, force: true });
+    }
     if (existsWithoutFollowing(renamedOriginal)) {
       fs.rmSync(renamedOriginal, { recursive: true, force: true });
     }

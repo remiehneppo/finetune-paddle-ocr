@@ -436,7 +436,7 @@ body.editor-focus-open {
 }
 
 /* Compact table editing mode */
-#block-list {
+.table-task-mode #block-list {
   max-height: 82px;
 }
 

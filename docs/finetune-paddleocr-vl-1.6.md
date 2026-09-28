@@ -212,18 +212,15 @@ Nhánh VL dùng trực tiếp với `--dataset-dir <root>/vl --prepare-only`. Nh
 layout kiểm tra/train bằng PaddleX 3.7.2 như sau:
 
 ```bash
-PADDLEX_CONFIG=.venv/lib/python3.12/site-packages/paddlex/configs/modules/layout_analysis/PP-DocLayoutV3.yaml
+.venv/bin/paddlex --install PaddleDetection --use_local_repos -y
 
-.venv/bin/python -c 'from paddlex.engine import Engine; Engine().run()' \
-  -c "$PADDLEX_CONFIG" \
-  -o Global.mode=check_dataset \
-  -o Global.dataset_dir=<root>/layout
+.venv/bin/python finetune_doclayout_v3.py \
+  --dataset-dir <root>/layout --work-dir runs/doclayoutv3-check \
+  --mode check-only
 
-.venv/bin/python -c 'from paddlex.engine import Engine; Engine().run()' \
-  -c "$PADDLEX_CONFIG" \
-  -o Global.mode=train \
-  -o Global.dataset_dir=<root>/layout \
-  -o Train.num_classes=25
+.venv/bin/python finetune_doclayout_v3.py \
+  --dataset-dir <root>/layout --work-dir runs/doclayoutv3-smoke \
+  --mode smoke
 ```
 
 ### Dùng lại dataset đã prepare
@@ -437,6 +434,7 @@ backend chưa cung cấp contract đó; checkpoints được giữ để so CER 
 ```bash
 PYTHONPATH=. pytest -q tests/test_finetune_vl.py tests/test_finetune.py
 PYTHONPATH=. pytest -q tests/test_finetune_vl_layout.py
+PYTHONPATH=. pytest -q tests/test_finetune_doclayout_v3.py
 bash -n download_pretrained_models.sh
 ```
 

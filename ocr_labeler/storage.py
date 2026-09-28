@@ -228,16 +228,17 @@ class AnnotationStore:
                 source_stat.st_mode
             ):
                 raise SourceImageChanged(record.relative_path)
+            if (
+                source_stat.st_size != record.size_bytes
+                or source_stat.st_mtime_ns != record.mtime_ns
+            ):
+                raise SourceImageChanged(record.relative_path)
             current_sha256 = _file_sha256(current_path)
         except SourceImageChanged:
             raise
         except (OSError, ValueError) as exc:
             raise SourceImageChanged(record.relative_path) from exc
-        if (
-            source_stat.st_size != record.size_bytes
-            or source_stat.st_mtime_ns != record.mtime_ns
-            or current_sha256 != record.sha256
-        ):
+        if current_sha256 != record.sha256:
             raise SourceImageChanged(record.relative_path)
         if annotation is None:
             return

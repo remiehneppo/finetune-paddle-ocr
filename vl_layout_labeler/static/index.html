@@ -11,8 +11,8 @@
   <header class="topbar">
     <div><h1>PaddleOCR-VL Layout Labeler</h1><p>PP-DocLayoutV3 + VL content → HF và COCO</p></div>
     <div class="toolbar">
-      <input id="folder-path" placeholder="Đường dẫn folder ảnh" />
-      <button id="open-folder">Mở folder</button>
+      <input id="folder-path" aria-label="Đường dẫn folder ảnh" placeholder="Đường dẫn folder ảnh" />
+      <button id="open-folder" type="button">Mở folder</button>
       <span id="workspace-status" class="workspace-status" role="status" aria-live="polite" hidden>
         <span class="spinner" aria-hidden="true"></span>
         <span id="workspace-message">Đang mở folder…</span>
@@ -24,18 +24,18 @@
   <main class="workspace">
     <aside class="sidebar">
       <div class="heading"><strong>Ảnh</strong><span id="image-count">0</span></div>
-      <div class="actions"><button id="detect-batch">Detect folder</button><button id="prelabel-batch">Prelabel folder</button><button id="cancel-batch">Hủy</button></div>
-      <progress id="batch-progress" max="1" value="0"></progress><div id="batch-status"></div>
+      <div class="actions"><button id="detect-batch" type="button">Detect folder</button><button id="prelabel-batch" type="button">Prelabel folder</button><button id="cancel-batch" type="button">Hủy</button></div>
+      <progress id="batch-progress" aria-label="Tiến độ batch" max="1" value="0"></progress><div id="batch-status" role="status" aria-live="polite"></div>
       <ol id="image-list"></ol>
     </aside>
     <section class="canvas-panel">
-      <div class="canvas-toolbar"><span id="current-name">Chọn ảnh</span><div class="page-zoom-controls" aria-label="Điều khiển ảnh gốc"><button id="page-fit" type="button">Fit</button><button id="page-actual" type="button">100%</button><button id="page-zoom-out" type="button" aria-label="Thu nhỏ ảnh gốc">−</button><span id="page-zoom-value">Fit</span><button id="page-zoom-in" type="button" aria-label="Phóng to ảnh gốc">+</button></div><button id="detect-current">Detect ảnh</button><button id="prelabel-page">Prelabel ảnh</button><button id="prelabel-current">Prelabel chọn</button><label class="validation-toggle"><input id="llm-validation" type="checkbox" /> LLM validation</label><button id="validate-current" class="secondary">Chạy lại validation</button><button id="add-mode">Thêm bbox</button><button id="complete-current">Complete</button><button id="reopen-current" class="secondary" hidden>Mở lại chỉnh sửa</button></div>
+      <div class="canvas-toolbar"><span id="current-name">Chọn ảnh</span><div class="page-zoom-controls" aria-label="Điều khiển ảnh gốc"><button id="page-fit" type="button">Fit</button><button id="page-actual" type="button">100%</button><button id="page-zoom-out" type="button" aria-label="Thu nhỏ ảnh gốc">−</button><span id="page-zoom-value">Fit</span><button id="page-zoom-in" type="button" aria-label="Phóng to ảnh gốc">+</button></div><button id="detect-current" type="button">Detect ảnh</button><button id="prelabel-page" type="button">Prelabel ảnh</button><button id="prelabel-current" type="button">Prelabel chọn</button><label class="validation-toggle"><input id="llm-validation" type="checkbox" /> LLM validation</label><button id="validate-current" class="secondary" type="button">Chạy lại validation</button><button id="add-mode" type="button">Thêm bbox</button><button id="complete-current" type="button">Complete</button><button id="reopen-current" class="secondary" type="button" hidden>Mở lại chỉnh sửa</button></div>
       <div id="operation-status" class="operation-status" role="status" aria-live="polite" hidden><span class="spinner" aria-hidden="true"></span><span id="operation-message">Model đang xử lý…</span></div>
       <div id="completed-banner" class="completed-banner" role="status" aria-live="polite" hidden><strong>✓ Ảnh đã Complete</strong><span>Chỉnh sửa đang bị khóa. Nhấn “Mở lại chỉnh sửa” nếu cần thay đổi output.</span></div>
       <div id="page-stage" tabindex="0" aria-label="Ảnh gốc. Lăn chuột để zoom; giữ Space và kéo hoặc kéo chuột giữa để di chuyển."><img id="page-image" alt="Trang tài liệu" draggable="false" /><svg id="overlay"></svg></div>
     </section>
-    <div id="inspector-separator" class="pane-separator" role="separator" aria-label="Điều chỉnh chiều rộng inspector" aria-orientation="vertical" aria-valuemin="340" aria-valuemax="760" aria-valuenow="440" tabindex="0"></div>
-    <aside class="inspector">
+    <div id="inspector-separator" class="pane-separator" role="separator" aria-label="Điều chỉnh chiều rộng inspector" aria-orientation="vertical" aria-controls="inspector" aria-valuemin="340" aria-valuemax="760" aria-valuenow="440" tabindex="0"></div>
+    <aside id="inspector" class="inspector">
       <div class="heading inspector-heading"><div><strong>Block</strong><span id="block-count">0</span></div><button id="editor-focus-toggle" type="button" aria-pressed="false" disabled>Tập trung</button></div>
       <ol id="block-list"></ol>
       <div id="editor" hidden>
@@ -95,7 +95,7 @@
           </div>
         </div>
       </div>
-      <details class="export-box"><summary>Xuất dữ liệu</summary><label>Output folder<input id="export-path" placeholder="/tmp/document-layout-export" /></label><div class="export-actions"><button id="export-hf">Export HF</button><button id="export-layout">Export Layout</button><button id="export-all">Export All</button></div><div id="export-status" class="export-status" hidden></div></details>
+      <details class="export-box"><summary>Xuất dữ liệu</summary><label>Output folder<input id="export-path" placeholder="/tmp/document-layout-export" /></label><div class="export-actions"><button id="export-hf" type="button">Export HF</button><button id="export-layout" type="button">Export Layout</button><button id="export-all" type="button">Export All</button></div><div id="export-status" class="export-status" role="status" aria-live="polite" hidden></div></details>
     </aside>
   </main>
   <script type="module" src="/static/app.mjs"></script>

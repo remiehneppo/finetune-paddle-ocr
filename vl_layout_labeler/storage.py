@@ -76,7 +76,10 @@ def _open_dir(root: Path, directory: Path, *, create: bool) -> int | None:
                 return None
             except OSError as exc:
                 raise UnsafePersistencePath("persistence directory is not safe") from exc
-            os.close(descriptor)
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
             descriptor = next_descriptor
         return descriptor
     except BaseException:
@@ -159,8 +162,9 @@ class AnnotationStore:
         if (
             source_stat.st_size != record.size_bytes
             or source_stat.st_mtime_ns != record.mtime_ns
-            or _file_sha256(current) != record.sha256
         ):
+            raise SourceImageChanged(record.relative_path)
+        if _file_sha256(current) != record.sha256:
             raise SourceImageChanged(record.relative_path)
         if annotation is not None:
             expected = (record.relative_path, record.width, record.height, record.sha256)

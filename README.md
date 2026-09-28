@@ -322,23 +322,22 @@ python finetune_vl.py --prepare-only \
 Kiểm tra và train nhánh layout bằng cấu hình PaddleX cài cùng môi trường:
 
 ```bash
-PADDLEX_CONFIG=.venv/lib/python3.12/site-packages/paddlex/configs/modules/layout_analysis/PP-DocLayoutV3.yaml
+.venv/bin/paddlex --install PaddleDetection --use_local_repos -y
 
-.venv/bin/python -c 'from paddlex.engine import Engine; Engine().run()' \
-  -c "$PADDLEX_CONFIG" \
-  -o Global.mode=check_dataset \
-  -o Global.dataset_dir=/path/to/export/layout
+.venv/bin/python finetune_doclayout_v3.py \
+  --dataset-dir /path/to/export/layout \
+  --work-dir runs/doclayoutv3-check \
+  --mode check-only
 
-.venv/bin/python -c 'from paddlex.engine import Engine; Engine().run()' \
-  -c "$PADDLEX_CONFIG" \
-  -o Global.mode=train \
-  -o Global.dataset_dir=/path/to/export/layout \
-  -o Train.num_classes=25
+.venv/bin/python finetune_doclayout_v3.py \
+  --dataset-dir /path/to/export/layout \
+  --work-dir runs/doclayoutv3-smoke \
+  --mode smoke
 ```
 
 ## Hướng dẫn đầy đủ các script fine-tune
 
-Repository có ba pipeline huấn luyện độc lập. Không dùng lẫn môi trường, model
+Repository có bốn pipeline huấn luyện độc lập. Không dùng lẫn môi trường, model
 weight hoặc format dataset giữa các pipeline:
 
 | Script | Bài toán | Dataset đầu vào | Backend | Artifact chính |
@@ -346,6 +345,7 @@ weight hoặc format dataset giữa các pipeline:
 | `finetune.py` | PP-OCRv6 text recognition trên ảnh crop | Hugging Face `save_to_disk()` hoặc Parquet local | `PaddleOCR/tools/train.py` | checkpoint trong `output/` |
 | `finetune_det.py` | PP-OCRv6 text detection trên ảnh trang | detection labeler workspace hoặc `det_labels.txt` | `PaddleOCR/tools/train.py` | `output/`, tùy chọn `inference/best_accuracy/` |
 | `finetune_vl.py` | PaddleOCR-VL-1.6 OCR/table/formula/chart | export VL của layout labeler hoặc prepared run | ERNIEKit OCR-VL-SFT + LoRA | adapter và HF merged model trong `adapter/export/` |
+| `finetune_doclayout_v3.py` | PP-DocLayoutV3 layout detection & read order | COCO layout export (`COCOInstSegDataset`) | PaddleX 3.7.2 + PaddleDetection | `output/best_model/`, `summary.json`, `preflight.json` |
 
 Hai utility của pipeline VL được trainer gọi tự động nhưng cũng có thể chạy độc lập:
 
@@ -354,9 +354,7 @@ Hai utility của pipeline VL được trainer gọi tự động nhưng cũng c
 | `evaluate_paddleocr_vl.py` | So sánh deterministic base/merged, tính CER, exact match, normalized edit distance và quality gate |
 | `merge_paddleocr_vl_lora.py` | Merge adapter ERNIEKit vào snapshot HF, kiểm tra weight merge và reload logits |
 
-`finetune_vl_layout.py` không tồn tại trong checkout này. Nhánh layout toàn trang
-được train bằng PaddleX theo lệnh ở phần
-[Dịch vụ gán nhãn layout](#dịch-vụ-gán-nhãn-layout-cho-paddleocr-vl-16).
+`finetune_vl_layout.py` không tồn tại trong checkout này (nhánh layout dùng script chuyên biệt `finetune_doclayout_v3.py`).
 
 ### Quy tắc chung
 
@@ -859,7 +857,86 @@ $ERNIEKIT_DIR/.venv/bin/python merge_paddleocr_vl_lora.py \
 Merge phải tạo `model.safetensors`, `merge_verification.json` và
 `logits_verification.json`; cả hai verification phải có status `passed`.
 
-### F. Quality gate và checkpoint selection VL
+### F. PP-DocLayoutV3 layout detection — `finetune_doclayout_v3.py`
+
+#### Dataset contract
+
+`--dataset-dir` nhận thư mục export layout của VL layout labeler (`COCOInstSegDataset`):
+
+```text
+layout/
+├── images/
+├── annotations/
+│   ├── instance_train.json
+│   └── instance_val.json
+└── export_manifest.json
+```
+
+- Bắt buộc đủ 25 classes PP-DocLayoutV3 đúng thứ tự chuẩn trong cả 2 split train/val.
+- Mỗi annotation có `bbox` (XYWH dương), đa giác `segmentation` (diện tích dương), và số nguyên không âm `read_order` liên tục từ 0 cho từng trang.
+- Script tự động reject khi phát hiện rò rỉ trang giữa train và val (`leakage`).
+
+#### Cài đặt backend plugin (chỉ cần chạy một lần)
+
+```bash
+.venv/bin/paddlex --install PaddleDetection --use_local_repos -y
+```
+
+#### Chạy kiểm tra dataset (check-only)
+
+```bash
+.venv/bin/python finetune_doclayout_v3.py \
+  --dataset-dir /path/to/export/layout \
+  --work-dir runs/doclayoutv3-check \
+  --mode check-only
+```
+
+#### Chạy GPU smoke test (1 epoch xác nhận tính toán)
+
+```bash
+.venv/bin/python finetune_doclayout_v3.py \
+  --dataset-dir /path/to/export/layout \
+  --work-dir runs/doclayoutv3-smoke \
+  --mode smoke
+```
+
+#### Chạy huấn luyện đầy đủ (full training)
+
+```bash
+.venv/bin/python finetune_doclayout_v3.py \
+  --dataset-dir /path/to/export/layout \
+  --work-dir runs/doclayoutv3-full \
+  --epochs 100 \
+  --batch-size 1 \
+  --num-workers 4 \
+  --learning-rate 0.0001
+```
+
+#### Toàn bộ args của `finetune_doclayout_v3.py`
+
+| Argument | Bắt buộc/default | Ý nghĩa |
+| --- | --- | --- |
+| `--dataset-dir PATH` | Bắt buộc | Thư mục layout dataset chứa `images/`, `annotations/`, `export_manifest.json`. |
+| `--work-dir PATH` | Tùy chọn | Thư mục lưu cấu hình resolved, log, preflight và output checkpoints. |
+| `--mode {full,check-only,smoke,benchmark,pilot}` | `full` | Chế độ chạy: `check-only` (chỉ validate dataset/config), `smoke` (1 epoch GPU), `benchmark`, `pilot` (tối đa 3 epoch), `full`. |
+| `--config PATH` | `configs/doclayoutv3/PP-DocLayoutV3-rtx5060ti.yaml` | Template cấu hình module PaddleX. |
+| `--backend-config PATH` | `configs/doclayoutv3/PP-DocLayoutV3-backend.yaml` | Cấu hình PaddleDetection backend. |
+| `--pretrained-weight PATH_OR_URL` | URL PaddleX official | Trọng số pretrained `.pdparams`. |
+| `--resume-from PATH` | Không có | Checkpoint để resume (kiểm tra chặt fingerprint dataset và config gốc). |
+| `--device STR` | `gpu:0` | Định danh GPU (profile RTX 5060 Ti hỗ trợ `gpu:0`). |
+| `--batch-size INT` | `1` | Batch size mỗi GPU (phải dương). |
+| `--num-workers INT` | `4` | Số loader workers (không âm). |
+| `--epochs INT` | `100` | Tổng số epochs (phải dương). |
+| `--learning-rate FLOAT` | `0.0001` | Learning rate (AdamW, finite & dương). |
+| `--warmup-steps INT` | `100` | Số warmup steps. |
+| `--eval-interval INT` | `1` | Tần suất đánh giá epoch. |
+| `--seed INT` | `2026` | Random seed. |
+| `--install-backend` | Tắt | Tự động chạy lệnh cài PaddleDetection backend trước khi chạy. |
+| `--skip-backend-check` | Tắt | Bỏ qua kiểm tra PaddleX backend (chỉ dùng cho offline unit test). |
+
+Output chính: `preflight.json`, `summary.json`, `resolved-config.yaml`, log file (`dataset-check.log` hoặc `train.log`), và thư mục checkpoints `output/`.
+
+### G. Quality gate và checkpoint selection VL
 
 Full run evaluate adapter cuối và tối đa `--eval-max-checkpoints` checkpoint gần
 nhất. Checkpoint được chọn theo CER, exact match và normalized edit distance,
@@ -884,7 +961,7 @@ adapter/export/logits_verification.json
 export_manifest.json
 ```
 
-### G. Lỗi thường gặp
+### H. Lỗi thường gặp
 
 | Triệu chứng | Xử lý |
 | --- | --- |
@@ -895,23 +972,26 @@ export_manifest.json
 | CUDA OOM VL | Giảm `--max-pixels`, giữ micro-batch 1, thử `--no-flash-attention`; không mở LoRA vision. |
 | CUDA OOM rec/det | Giảm `--batch-size` trước; recognition mới cân nhắc giảm `--image-width`. |
 | Detection pretrained mismatch | Dùng training `.pdparams` đúng model, không dùng inference directory. |
+| PP-DocLayoutV3 is not a registered model name | Cài plugin PaddleDetection bằng `.venv/bin/paddlex --install PaddleDetection --use_local_repos -y`. |
 | AMP/GradScaler lỗi NumPy | Cài dependency đã pin, đặc biệt `numpy<2.4`. |
 | Validation quá ít | Bổ sung validation theo page/task; không hạ gate chỉ để tuyên bố pass. |
 | Merge output tồn tại | Chọn output mới; utility cố ý không ghi đè safetensors. |
 
-### H. Kiểm tra trước bàn giao
+### I. Kiểm tra trước bàn giao
 
 ```bash
 PYTHONPATH=. pytest -q \
   tests/test_finetune.py \
   tests/test_finetune_det.py \
   tests/test_finetune_vl.py \
-  tests/test_finetune_vl_layout.py
+  tests/test_finetune_vl_layout.py \
+  tests/test_finetune_doclayout_v3.py
 
 bash -n download_pretrained_models.sh
 python finetune.py --help >/tmp/finetune-rec-help.txt
 python finetune_det.py --help >/tmp/finetune-det-help.txt
 python finetune_vl.py --help >/tmp/finetune-vl-help.txt
+python finetune_doclayout_v3.py --help >/tmp/finetune-doclayout-help.txt
 python evaluate_paddleocr_vl.py --help >/tmp/evaluate-vl-help.txt
 python merge_paddleocr_vl_lora.py --help >/tmp/merge-vl-help.txt
 ```

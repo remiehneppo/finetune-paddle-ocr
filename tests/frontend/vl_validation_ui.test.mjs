@@ -74,8 +74,8 @@ test("preview creates text nodes and one mark without innerHTML", () => {
 });
 
 test("application contract locks duplicate requests and focuses exact raw span", () => {
-  const script = readFileSync("vl_layout_labeler/static/app.mjs", "utf8");
-  const html = readFileSync("vl_layout_labeler/static/index.html", "utf8");
+  const script = readFileSync(new URL("../../vl_layout_labeler/static/app.mjs", import.meta.url), "utf8");
+  const html = readFileSync(new URL("../../vl_layout_labeler/static/index.html", import.meta.url), "utf8");
   assert.match(script, /if \(!state\.currentId \|\| state\.busy \|\| state\.batchBusy\) return/);
   assert.match(script, /setSelectionRange\(range\.start, range\.end\)/);
   assert.match(script, /invalidateBlockValidation\(block\)/);

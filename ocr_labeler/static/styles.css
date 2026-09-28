@@ -151,26 +151,33 @@ textarea:focus-visible,
 
 #page-image {
   position: absolute;
+  top: 0;
+  left: 0;
   display: block;
   max-width: none;
   max-height: none;
   user-select: none;
+  pointer-events: none;
 }
 
 #overlay {
   position: absolute;
+  top: 0;
+  left: 0;
   pointer-events: auto;
   touch-action: none;
+  overflow: visible;
 }
 
 .polygon--text { fill: rgb(34 197 94 / 12%); stroke: #16a34a; }
 .polygon--manual { fill: rgb(249 115 22 / 12%); stroke: #ea580c; }
 .polygon--low-confidence { fill: rgb(249 115 22 / 18%); stroke: #ea580c; }
-.polygon--selected { fill: rgb(14 165 233 / 16%); stroke: #0284c7; }
+.polygon--selected { fill: rgb(14 165 233 / 16%); stroke: #0284c7; cursor: move; }
 .polygon-handle { fill: #fff; stroke: #0284c7; stroke-width: 2; cursor: grab; }
+.polygon-handle:active { cursor: grabbing; }
 .polygon-handle:focus-visible { outline: 3px solid #facc15; }
 .polygon-label { fill: #fff; font: 700 13px/1 system-ui, sans-serif; paint-order: stroke; stroke: #111827; stroke-width: 3px; pointer-events: none; }
-.polygon--preview { stroke-dasharray: 5 3; }
+.polygon--preview { stroke-dasharray: 5 3; pointer-events: none; }
 
 #block-list { min-height: 180px; }
 .block-item { display: flex; align-items: center; gap: 0.35rem; border-bottom: 1px solid #f1f5f9; padding: 0.25rem 0.45rem; cursor: grab; }

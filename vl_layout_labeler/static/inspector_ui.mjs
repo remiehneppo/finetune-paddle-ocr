@@ -135,11 +135,14 @@ function renderCrop() {
 
 function enhanceEditorPresentation() {
   const visualEditor = $("visual-editor");
-  const tableVisualMode = $("task").value === "table" && !$("visual-panel").hidden;
-  document.querySelector(".editor-scroll").classList.toggle("table-task-mode", tableVisualMode);
+  if (!visualEditor) return;
+  const task = $("task")?.value;
+  const visualPanel = $("visual-panel");
+  const tableVisualMode = task === "table" && Boolean(visualPanel && !visualPanel.hidden);
+  document.querySelector(".editor-scroll")?.classList.toggle("table-task-mode", tableVisualMode);
   visualEditor.classList.toggle(
     "vertical-text-mode",
-    $("task").value === "ocr" && $("layout-label").value === "vertical_text",
+    task === "ocr" && $("layout-label")?.value === "vertical_text",
   );
   for (const textarea of visualEditor.querySelectorAll(".cell-input, .target-grid textarea")) {
     const lines = textarea.value.split("\n");
